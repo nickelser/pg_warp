@@ -87,7 +87,22 @@ func (s logStats) deletesPerSecond() float64 {
 	return float64(s.deletes) / s.secondsElapsed()
 }
 
-func startReplication(slotName string, replicationConn *pgx.ReplicationConn, targetConn *pgx.Conn, tables map[string][]string, originName string, lastCommittedSourceLsn string) (chan bool, error) {
+func retrieveLagAndOutputStats(sourceConn *pgx.Conn, stats logStats, maxWal uint64) {
+	var replicationLag string
+	var err error
+
+	err = sourceConn.QueryRow("SELECT pg_size_pretty(pg_xlog_location_diff(pg_current_xlog_flush_location(), replay_location)) FROM pg_stat_replication WHERE application_name = 'pg_warp'").Scan(&replicationLag)
+	if err != nil {
+		fmt.Printf("Failed to retrieve replication lag: %s", err)
+		os.Exit(1)
+	}
+
+	// TODO: timestamp of last transaction replayed (after that COMMIT happened)
+	fmt.Printf("Stats: %0.2f TX/s, %0.2f inserts/s, %0.2f updates/s, %0.2f deletes/s, last LSN received: %s, replication lag: %s\n",
+		stats.txPerSecond(), stats.insertsPerSecond(), stats.updatesPerSecond(), stats.deletesPerSecond(), pgx.FormatLSN(maxWal), replicationLag)
+}
+
+func startReplication(slotName string, replicationConn *pgx.ReplicationConn, sourceConn *pgx.Conn, targetConn *pgx.Conn, tables map[string][]string, originName string, lastCommittedSourceLsn string) (chan bool, error) {
 	var err error
 
 	stop := make(chan bool)
@@ -132,9 +147,9 @@ func startReplication(slotName string, replicationConn *pgx.ReplicationConn, tar
 			case <-standbyStatusTick:
 				sendStandbyStatus = true
 			case <-logTick:
-				// TODO: timestamp of last transaction replayed (after that COMMIT happened)
-				fmt.Printf("Stats: %0.2f TX/s, %0.2f inserts/s, %0.2f updates/s, %0.2f deletes/s, last LSN received: %s\n",
-					stats.txPerSecond(), stats.insertsPerSecond(), stats.updatesPerSecond(), stats.deletesPerSecond(), pgx.FormatLSN(maxWal))
+				// TODO: This will be a problem if we ever need more than 5s to retrieve
+				// the lag state from the source connection (since we're missing a mutex)
+				go retrieveLagAndOutputStats(sourceConn, stats, maxWal)
 				stats = logStats{start: time.Now()}
 			case <-stop:
 				replicationConn.Close()
@@ -231,6 +246,7 @@ func main() {
 		fmt.Printf("Could not parse source connection URI: %v\n", err)
 		return
 	}
+	sourceConnConfig.RuntimeParams["application_name"] = "pg_warp"
 
 	sourceConn, err := pgx.Connect(sourceConnConfig)
 	if err != nil {
@@ -268,6 +284,7 @@ func main() {
 		fmt.Printf("Could not parse target connection URI: %v\n", err)
 		return
 	}
+	targetConnConfig.RuntimeParams["application_name"] = "pg_warp"
 	targetConn, err := pgx.Connect(targetConnConfig)
 	if err != nil {
 		fmt.Printf("Unable to establish target SQL connection: %v\n", err)
@@ -370,7 +387,7 @@ func main() {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
 
-	stop, err := startReplication(slotName, replicationConn, targetConn, tables, originName, lastCommittedSourceLsn)
+	stop, err := startReplication(slotName, replicationConn, sourceConn, targetConn, tables, originName, lastCommittedSourceLsn)
 	if err != nil {
 		fmt.Printf("%s\n", err)
 		return

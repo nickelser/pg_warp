@@ -207,8 +207,6 @@ func Decode(message string, replicaIdentities map[string][]string) (string, stri
 					whereClause += column.name + " = " + column.value
 				}
 			} else {
-				// TODO: Failed to handle WAL message: Could not apply stream to target: ERROR: modifying the partition value of rows is not allowed (SQLSTATE 0A000)
-				// We should not include the partition value again
 				for _, column := range parseResult.columns {
 					identityColumn := false
 					for _, identityColumnName := range replicaIdentity {
