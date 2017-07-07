@@ -7,11 +7,12 @@ import (
 	"os/exec"
 	"os/signal"
 	"reflect"
+	"strings"
 	"syscall"
 	"time"
 
-	"github.com/jackc/pgx"
 	"github.com/citusdata/pg_warp/consumer"
+	"github.com/jackc/pgx"
 	flag "github.com/ogier/pflag"
 )
 
@@ -37,67 +38,117 @@ func makeBaseBackup(sourceURL string, targetURL string, snapshotName string) err
 	return nil
 }
 
-func handleDecodingMessage(message string, targetConn *pgx.Conn, tables map[string][]string) error {
-	//fmt.Printf("WAL Message: %s\n", message)
-	sql := consumer.Decode(message, tables)
+func handleDecodingMessage(message string, targetConn *pgx.Conn, tables map[string][]string, stats *logStats) error {
+	sql, sqlType := consumer.Decode(message, tables)
 	if sql != "" {
 		_, err := targetConn.Exec(sql)
 		if err != nil {
 			return fmt.Errorf("Could not apply stream to target: %s\n  SQL: %q", err, sql)
 		}
 	}
+	switch sqlType {
+	case "COMMIT":
+		stats.tx++
+	case "INSERT":
+		stats.inserts++
+	case "UPDATE":
+		stats.updates++
+	case "DELETE":
+		stats.deletes++
+	}
 	return nil
 }
 
-func startReplication(slotName string, replicationConn *pgx.ReplicationConn, targetConn *pgx.Conn, tables map[string][]string) (chan bool, error) {
+type logStats struct {
+	start   time.Time
+	tx      uint64
+	inserts uint64
+	updates uint64
+	deletes uint64
+}
+
+func (s logStats) secondsElapsed() float64 {
+	return float64(time.Since(s.start)) / float64(time.Second)
+}
+
+func (s logStats) txPerSecond() float64 {
+	return float64(s.tx) / s.secondsElapsed()
+}
+
+func (s logStats) insertsPerSecond() float64 {
+	return float64(s.inserts) / s.secondsElapsed()
+}
+
+func (s logStats) updatesPerSecond() float64 {
+	return float64(s.updates) / s.secondsElapsed()
+}
+
+func (s logStats) deletesPerSecond() float64 {
+	return float64(s.deletes) / s.secondsElapsed()
+}
+
+func startReplication(slotName string, replicationConn *pgx.ReplicationConn, targetConn *pgx.Conn, tables map[string][]string, originName string, lastCommittedSourceLsn string) (chan bool, error) {
+	var err error
+
 	stop := make(chan bool)
 
-	err := replicationConn.StartReplication(slotName, 0, -1)
+	startLsn := uint64(0)
+	if lastCommittedSourceLsn != "" {
+		startLsn, err = pgx.ParseLSN(lastCommittedSourceLsn)
+		if err != nil {
+			return stop, fmt.Errorf("Failed to parse last committed source LSN: %s", err)
+		}
+	}
+
+	err = replicationConn.StartReplication(slotName, startLsn, -1)
 	if err != nil {
 		return stop, fmt.Errorf("Failed to start replication: %v", err)
 	}
 
 	fmt.Printf("Started replication\n")
 
-	// TODO: Actually read wal_sender_timeout
-	walSenderTimeoutSecs := 30 * time.Second
+	_, err = targetConn.Exec(fmt.Sprintf("SELECT pg_replication_origin_session_setup('%s')", originName))
+	if err != nil {
+		return stop, fmt.Errorf("Failed to setup replication origin session on target: %v", err)
+	}
 
-	statusInterval := time.Duration(walSenderTimeoutSecs / 4)
-
-	//fmt.Printf("%+v\n", tables)
+	standbyStatusInterval := time.Duration(1 * time.Second)
+	logInterval := time.Duration(5 * time.Second)
 
 	go func() {
 		var maxWal uint64
-		var message *pgx.ReplicationMessage
-		var status *pgx.StandbyStatus
 
-		tick := time.Tick(statusInterval)
+		stats := logStats{start: time.Now()}
+
+		standbyStatusTick := time.Tick(standbyStatusInterval)
+		logTick := time.Tick(logInterval)
 
 		for {
+			var message *pgx.ReplicationMessage
+			var status *pgx.StandbyStatus
+			var sendStandbyStatus bool
+
 			select {
-			case <-tick:
-				status, err = pgx.NewStandbyStatus(maxWal)
-				if err != nil {
-					fmt.Printf("ERROR: Failed to create standby status %v\n", err)
-					syscall.Kill(syscall.Getpid(), syscall.SIGTERM)
-					break
-				}
-				replicationConn.SendStandbyStatus(status)
+			case <-standbyStatusTick:
+				sendStandbyStatus = true
+			case <-logTick:
+				// TODO: timestamp of last transaction replayed (after that COMMIT happened)
+				fmt.Printf("Stats: %0.2f TX/s, %0.2f inserts/s, %0.2f updates/s, %0.2f deletes/s, last LSN received: %s\n",
+					stats.txPerSecond(), stats.insertsPerSecond(), stats.updatesPerSecond(), stats.deletesPerSecond(), pgx.FormatLSN(maxWal))
+				stats = logStats{start: time.Now()}
 			case <-stop:
 				replicationConn.Close()
 				return
 			default:
-				message, err = replicationConn.WaitForReplicationMessage(statusInterval)
+				message, err = replicationConn.WaitForReplicationMessage(standbyStatusInterval)
 				if err != nil {
 					if err == io.EOF {
 						fmt.Printf("End of stream (EOF), stopping replication\n")
-						syscall.Kill(syscall.Getpid(), syscall.SIGTERM)
-						break
+						os.Exit(1)
 					}
 					if err != pgx.ErrNotificationTimeout {
 						fmt.Printf("ERROR: Replication failed: %v %s\n", err, reflect.TypeOf(err))
-						syscall.Kill(syscall.Getpid(), syscall.SIGTERM)
-						break
+						os.Exit(1)
 					}
 				}
 			}
@@ -105,9 +156,20 @@ func startReplication(slotName string, replicationConn *pgx.ReplicationConn, tar
 			if message != nil {
 				if message.WalMessage != nil {
 					walString := string(message.WalMessage.WalData)
-					err = handleDecodingMessage(walString, targetConn, tables)
+
+					if strings.HasPrefix(walString, "COMMIT") {
+						// FIXME: Replace now() with the timestamp from the COMMIT message (when running with include-timestamps)
+						_, err = targetConn.Exec(fmt.Sprintf("SELECT pg_replication_origin_xact_setup('%s', now()); SELECT txid_current();", pgx.FormatLSN(message.WalMessage.WalStart)))
+						if err != nil {
+							fmt.Printf("Could not setup replication origin for transaction on target: %s", err)
+							os.Exit(1)
+						}
+					}
+
+					err = handleDecodingMessage(walString, targetConn, tables, &stats)
 					if err != nil {
 						fmt.Printf("Failed to handle WAL message: %s\n", err)
+						os.Exit(1)
 					}
 
 					if message.WalMessage.WalStart > maxWal {
@@ -115,14 +177,32 @@ func startReplication(slotName string, replicationConn *pgx.ReplicationConn, tar
 					}
 				}
 				if message.ServerHeartbeat != nil && message.ServerHeartbeat.ReplyRequested == '1' {
-					status, err = pgx.NewStandbyStatus(maxWal)
-					if err != nil {
-						fmt.Printf("ERROR: Failed to create standby status %v\n", err)
-						syscall.Kill(syscall.Getpid(), syscall.SIGTERM)
-						break
-					}
-					replicationConn.SendStandbyStatus(status)
+					sendStandbyStatus = true
 				}
+			}
+
+			if sendStandbyStatus {
+				var lsnStr string
+				var lsn uint64
+
+				err = targetConn.QueryRow("SELECT COALESCE(pg_replication_origin_session_progress(true), '0/0')").Scan(&lsnStr)
+				if err != nil {
+					fmt.Printf("Failed to retrieve replication origin progress from target session: %s", err)
+					os.Exit(1)
+				}
+
+				lsn, err = pgx.ParseLSN(lsnStr)
+				if err != nil {
+					fmt.Printf("Failed to parse target session progress LSN: %s\n", err)
+					os.Exit(1)
+				}
+
+				status, err = pgx.NewStandbyStatus(lsn, lsn, maxWal)
+				if err != nil {
+					fmt.Printf("ERROR: Failed to create standby status %v\n", err)
+					os.Exit(1)
+				}
+				replicationConn.SendStandbyStatus(status)
 			}
 		}
 	}()
@@ -132,12 +212,18 @@ func startReplication(slotName string, replicationConn *pgx.ReplicationConn, tar
 
 func main() {
 	var slotName string
+	var originName string
 	var sourceURL string
 	var targetURL string
+	var resync bool
+	var clean bool
 
 	flag.StringVar(&slotName, "slot", "pg_warp", "name of the logical replication slot on the source database")
+	flag.StringVar(&originName, "origin", "pg_warp", "name of the replication origin on the target database")
 	flag.StringVarP(&sourceURL, "source", "s", "", "postgres:// connection string for the source database (user needs replication privileges)")
 	flag.StringVarP(&targetURL, "target", "t", "", "postgres:// connection string for the target database")
+	flag.BoolVar(&resync, "resync", false, "Resynchronize replication with a new base backup")
+	flag.BoolVar(&clean, "clean", false, "Cleans replication slot on source, and replication origin on target (run this after you don't need replication anymore)")
 	flag.Parse()
 
 	sourceConnConfig, err := pgx.ParseURI(sourceURL)
@@ -210,48 +296,90 @@ func main() {
 	}
 	defer replicationConn.Close()
 
-	// Create replication slot with "skip-empty-xacts" option
-	var snapshotName string
-	snapshotName, err = replicationConn.CreateReplicationSlotAndGetSnapshotName(slotName, "test_decoding")
+	// Support public.pg_replication_origin security definer functions on target
+	_, err = targetConn.Exec("SET search_path = public, pg_catalog")
 	if err != nil {
-		fmt.Printf("replication slot create failed: %v\n", err)
+		fmt.Printf("Could not set search path on target: %s\n", err)
 		return
 	}
 
-	fmt.Printf("Truncating target tables\n")
-	err = truncateTargetTables(targetConn, tables)
-	if err != nil {
-		fmt.Printf("Target truncate failed: %s\n", err)
-		return
-	}
+	var lastCommittedSourceLsn string
 
-	fmt.Printf("Making base backup\n")
-	err = makeBaseBackup(sourceURL, targetURL, snapshotName)
-	if err != nil {
-		fmt.Printf("Base backup failed: %s\n", err)
-		err = replicationConn.DropReplicationSlot(slotName)
-		if err != nil {
+	if resync || clean {
+		_, err = sourceConn.Exec(fmt.Sprintf("SELECT pg_drop_replication_slot('%s')", slotName))
+		if err != nil && !strings.HasPrefix(err.Error(), fmt.Sprintf("ERROR: replication slot \"%s\" does not exist", slotName)) {
 			fmt.Printf("Error dropping replication slot: %s\n", err)
+			return
 		}
+
+		_, err = targetConn.Exec(fmt.Sprintf("SELECT pg_replication_origin_drop('%s')", originName))
+		if err != nil && !strings.HasPrefix(err.Error(), fmt.Sprintf("ERROR: cache lookup failed for replication origin '%s'", originName)) {
+			fmt.Printf("Error dropping replication origin: %s\n", err)
+			return
+		}
+	} else {
+		err = targetConn.QueryRow(fmt.Sprintf("SELECT COALESCE(pg_replication_origin_progress('%s', true), '0/0')", originName)).Scan(&lastCommittedSourceLsn)
+		if err != nil && !strings.HasPrefix(err.Error(), "ERROR: cache lookup failed for replication origin") {
+			fmt.Printf("Failed to retrieve replication origin progress from target: %s", err)
+			os.Exit(1)
+		}
+	}
+
+	if clean {
+		fmt.Printf("Replication slot and origin removed successfully\n")
 		return
+	}
+
+	if lastCommittedSourceLsn == "" {
+		fmt.Printf("Creating replication slot on source...\n")
+		// Create replication slot with "skip-empty-xacts", "include-timestamps" option
+		var snapshotName string
+		snapshotName, err = replicationConn.CreateReplicationSlotAndGetSnapshotName(slotName, "test_decoding")
+		if err != nil {
+			fmt.Printf("replication slot create failed: %v\n", err)
+			return
+		}
+
+		fmt.Printf("Truncating target tables...\n")
+		err = truncateTargetTables(targetConn, tables)
+		if err != nil {
+			fmt.Printf("Target truncate failed: %s\n", err)
+			return
+		}
+
+		fmt.Printf("Making base backup...\n")
+		err = makeBaseBackup(sourceURL, targetURL, snapshotName)
+		if err != nil {
+			fmt.Printf("Base backup failed: %s\n", err)
+			err = replicationConn.DropReplicationSlot(slotName)
+			if err != nil {
+				fmt.Printf("Error dropping replication slot: %s\n", err)
+			}
+			return
+		}
+
+		_, err = targetConn.Exec(fmt.Sprintf("SELECT pg_replication_origin_create('%s')", originName))
+		if err != nil {
+			fmt.Printf("%s\n", err)
+			return
+		}
+	} else {
+		fmt.Printf("Resuming previous operation for slot %s, last committed source LSN: %s\n", slotName, lastCommittedSourceLsn)
 	}
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
 
-	stop, err := startReplication(slotName, replicationConn, targetConn, tables)
+	stop, err := startReplication(slotName, replicationConn, targetConn, tables, originName, lastCommittedSourceLsn)
 	if err != nil {
 		fmt.Printf("%s\n", err)
 		return
 	}
 
 	s := <-sigs
-	fmt.Printf("Received %s, dropping replication slot and exiting...\n", s)
+	fmt.Printf("Received %s, exiting...\n", s)
 
 	stop <- true
 
-	_, err = sourceConn.Exec(fmt.Sprintf("SELECT pg_drop_replication_slot('%s')", slotName))
-	if err != nil {
-		fmt.Printf("Error dropping replication slot: %s\n", err)
-	}
+	fmt.Printf("WARNING: Replication slot and origin still exist, re-run with \"--clean\" to remove (otherwise your source system can experience problems!)\n")
 }

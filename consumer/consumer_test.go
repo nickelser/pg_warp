@@ -3,7 +3,7 @@ package consumer_test
 import (
 	"testing"
 
-	"github.com/lfittl/eve/consumer"
+	"github.com/citusdata/pg_warp/consumer"
 )
 
 var decodertests = []struct {
@@ -28,7 +28,7 @@ var replicaIdentities = map[string][]string{
 
 func TestDecoder(t *testing.T) {
 	for _, tt := range decodertests {
-		s := consumer.Decode(tt.in, replicaIdentities)
+		s, _ := consumer.Decode(tt.in, replicaIdentities)
 		if s != tt.out {
 			t.Errorf("decode(%q)\n got: %q\n want: %q", tt.in, s, tt.out)
 		}

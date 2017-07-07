@@ -6,10 +6,10 @@ import (
 )
 
 const (
-	parseStateNull           = iota
-	parseStateEscapedLiteral = iota
-	parseStateEscapedValue   = iota
-	parseStateEnd            = iota
+	parseStateNull              = iota
+	parseStateEscapedIdentifier = iota
+	parseStateEscapedLiteral    = iota
+	parseStateEnd               = iota
 
 	parseStateRelation       = iota
 	parseStateAction         = iota
@@ -73,7 +73,7 @@ func parseTableMessage(message string) (parseResult, error) {
 				state.current = parseStateAction
 			} else if chr == '"' {
 				state.prev = state.current
-				state.current = parseStateEscapedLiteral
+				state.current = parseStateEscapedIdentifier
 			}
 		case parseStateAction:
 			if chr == ':' {
@@ -101,7 +101,7 @@ func parseTableMessage(message string) (parseResult, error) {
 				state.current = parseStateEnd
 			} else if chr == '"' {
 				state.prev = state.current
-				state.current = parseStateEscapedLiteral
+				state.current = parseStateEscapedIdentifier
 			}
 		case parseStateColumnDataType:
 			if chr == ']' {
@@ -113,7 +113,7 @@ func parseTableMessage(message string) (parseResult, error) {
 				state.current = parseStateColumnValue
 			} else if chr == '"' {
 				state.prev = state.current
-				state.current = parseStateEscapedLiteral
+				state.current = parseStateEscapedIdentifier
 			}
 		case parseStateColumnValue:
 			if chr == '\000' {
@@ -131,9 +131,9 @@ func parseTableMessage(message string) (parseResult, error) {
 				state.current = parseStateColumnName
 			} else if chr == '\'' {
 				state.prev = state.current
-				state.current = parseStateEscapedValue
+				state.current = parseStateEscapedLiteral
 			}
-		case parseStateEscapedLiteral:
+		case parseStateEscapedIdentifier:
 			if chr == '"' {
 				if chrNext == '"' {
 					i++
@@ -142,7 +142,7 @@ func parseTableMessage(message string) (parseResult, error) {
 					state.prev = parseStateNull
 				}
 			}
-		case parseStateEscapedValue:
+		case parseStateEscapedLiteral:
 			if chr == '\'' {
 				if chrNext == '\'' {
 					i++
@@ -161,23 +161,23 @@ func parseTableMessage(message string) (parseResult, error) {
 	return result, nil
 }
 
-func Decode(message string, replicaIdentities map[string][]string) string {
+func Decode(message string, replicaIdentities map[string][]string) (string, string) {
 	if strings.HasPrefix(message, "BEGIN") {
-		return "BEGIN"
+		return "BEGIN", "BEGIN"
 	}
 	if strings.HasPrefix(message, "COMMIT") {
-		return "COMMIT"
+		return "COMMIT", "COMMIT"
 	}
 
 	if strings.HasPrefix(message, "table ") {
 		parseResult, err := parseTableMessage(message)
 		if err != nil {
 			fmt.Printf("Parser error: %+v\n", err)
-			return ""
+			return "", ""
 		}
 		if parseResult.noTupleData {
 			fmt.Printf("No tuple data: %s\n", message)
-			return ""
+			return "", ""
 		}
 
 		targetRelation := parseResult.relation
@@ -196,7 +196,7 @@ func Decode(message string, replicaIdentities map[string][]string) string {
 
 		switch action {
 		case "INSERT":
-			return fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", targetRelation, strings.Join(columnNames, ", "), strings.Join(columnValues, ", "))
+			return fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", targetRelation, strings.Join(columnNames, ", "), strings.Join(columnValues, ", ")), "INSERT"
 		case "UPDATE":
 			whereClause := ""
 			if len(parseResult.oldKey) > 0 {
@@ -226,10 +226,10 @@ func Decode(message string, replicaIdentities map[string][]string) string {
 				}
 				if whereClause == "" {
 					fmt.Printf("No known replica identity: %s\n", message)
-					return ""
+					return "", ""
 				}
 			}
-			return fmt.Sprintf("UPDATE %s SET (%s) = (%s) WHERE %s", targetRelation, strings.Join(columnNames, ", "), strings.Join(columnValues, ", "), whereClause)
+			return fmt.Sprintf("UPDATE %s SET (%s) = (%s) WHERE %s", targetRelation, strings.Join(columnNames, ", "), strings.Join(columnValues, ", "), whereClause), "UPDATE"
 		case "DELETE":
 			// The column/data values here are the replica identity (i.e. what we want to match on)
 			whereClause := ""
@@ -239,8 +239,8 @@ func Decode(message string, replicaIdentities map[string][]string) string {
 				}
 				whereClause += column.name + " = " + column.value
 			}
-			return fmt.Sprintf("DELETE FROM %s WHERE %s", targetRelation, whereClause)
+			return fmt.Sprintf("DELETE FROM %s WHERE %s", targetRelation, whereClause), "DELETE"
 		}
 	}
-	return ""
+	return "", ""
 }
