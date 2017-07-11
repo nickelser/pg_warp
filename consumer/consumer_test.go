@@ -22,8 +22,9 @@ var decodertests = []struct {
 }
 
 var replicaIdentities = map[string][]string{
-	"public.z":   {"id"},
-	"public.xyz": {"id"},
+	"public.z":    {"id"},
+	"public.xyz":  {"id"},
+	"public.data": {},
 }
 
 func TestDecoder(t *testing.T) {

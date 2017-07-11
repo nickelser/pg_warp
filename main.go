@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path"
 	"reflect"
 	"strings"
 	"syscall"
@@ -16,34 +17,60 @@ import (
 	flag "github.com/ogier/pflag"
 )
 
-func truncateTargetTables(targetConn *pgx.Conn, tables map[string][]string) error {
+func truncateDestinationTables(destinationConn *pgx.Conn, tables map[string][]string) error {
 	for table := range tables {
-		_, err := targetConn.Exec(fmt.Sprintf("TRUNCATE %s", table))
+		_, err := destinationConn.Exec(fmt.Sprintf("TRUNCATE %s", table))
 		if err != nil {
-			return fmt.Errorf("Failed to truncate %s on target: %s", table, err)
+			return fmt.Errorf("Failed to truncate %s on destination: %s", table, err)
 		}
 	}
 	return nil
 }
 
-func makeBaseBackup(sourceURL string, targetURL string, snapshotName string) error {
-	// TODO: Write this to a directory (-Fd) and then dump and load in parallel using -p
-	cmd := exec.Command("/bin/sh", "-c", fmt.Sprintf("pg_dump -Fc --snapshot=%s %s | pg_restore --data-only --no-acl --no-owner -d %s", snapshotName, sourceURL, targetURL))
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stdout
-	err := cmd.Run()
-	if err != nil {
-		return fmt.Errorf("Error copying data: %s\n", err)
+func makeBaseBackup(sourceURL string, destinationURL string, snapshotName string, parallelDump uint32, parallelRestore uint32, tmpDir string, includedTables []string, excludedTables []string) error {
+	dumpCommand := fmt.Sprintf("pg_dump --snapshot=%s -d %s", snapshotName, sourceURL)
+	restoreCommand := fmt.Sprintf("pg_restore --data-only --no-acl --no-owner -d %s", destinationURL)
+
+	for _, includeTable := range includedTables {
+		dumpCommand += " -t" + includeTable
+	}
+	for _, excludeTable := range excludedTables {
+		dumpCommand += " -t" + excludeTable
+	}
+
+	if parallelDump > 1 || parallelRestore > 1 {
+		dumpDir := path.Join(tmpDir, "dump")
+		err := os.MkdirAll(dumpDir, 0755)
+		if err != nil {
+			return fmt.Errorf("Could not create dump directory: %s\n", err)
+		}
+
+		dumpCommand += fmt.Sprintf("-Fd -j %d -f %s", parallelDump, dumpDir)
+		restoreCommand += fmt.Sprintf("-Fd -j%d %s", parallelRestore, dumpDir)
+
+		err = os.RemoveAll(dumpDir)
+		if err != nil {
+			return fmt.Errorf("Could not remove dump directory: %s\n", err)
+		}
+	} else {
+		dumpCommand += " -Fc"
+		cmd := exec.Command("/bin/sh", "-c", fmt.Sprintf("%s | %s", dumpCommand, restoreCommand))
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stdout
+		err := cmd.Run()
+		if err != nil {
+			return fmt.Errorf("Error copying data: %s\n", err)
+		}
 	}
 	return nil
 }
 
-func handleDecodingMessage(message string, targetConn *pgx.Conn, tables map[string][]string, stats *logStats) error {
+func handleDecodingMessage(message string, destinationConn *pgx.Conn, tables map[string][]string, stats *logStats) error {
 	sql, sqlType := consumer.Decode(message, tables)
 	if sql != "" {
-		_, err := targetConn.Exec(sql)
+		_, err := destinationConn.Exec(sql)
 		if err != nil {
-			return fmt.Errorf("Could not apply stream to target: %s\n  SQL: %q", err, sql)
+			return fmt.Errorf("Could not apply stream to destination: %s\n  SQL: %q", err, sql)
 		}
 	}
 	switch sqlType {
@@ -91,9 +118,9 @@ func retrieveLagAndOutputStats(sourceConn *pgx.Conn, stats logStats, maxWal uint
 	var replicationLag string
 	var err error
 
-	err = sourceConn.QueryRow("SELECT pg_size_pretty(pg_xlog_location_diff(pg_current_xlog_flush_location(), replay_location)) FROM pg_stat_replication WHERE application_name = 'pg_warp'").Scan(&replicationLag)
+	err = sourceConn.QueryRow("SELECT COALESCE(pg_size_pretty(pg_xlog_location_diff(pg_current_xlog_flush_location(), replay_location)), 'n/a') FROM pg_stat_replication WHERE application_name = 'pg_warp'").Scan(&replicationLag)
 	if err != nil {
-		fmt.Printf("Failed to retrieve replication lag: %s", err)
+		fmt.Printf("Failed to retrieve replication lag: %s\n", err)
 		os.Exit(1)
 	}
 
@@ -102,7 +129,7 @@ func retrieveLagAndOutputStats(sourceConn *pgx.Conn, stats logStats, maxWal uint
 		stats.txPerSecond(), stats.insertsPerSecond(), stats.updatesPerSecond(), stats.deletesPerSecond(), pgx.FormatLSN(maxWal), replicationLag)
 }
 
-func startReplication(slotName string, replicationConn *pgx.ReplicationConn, sourceConn *pgx.Conn, targetConn *pgx.Conn, tables map[string][]string, originName string, lastCommittedSourceLsn string) (chan bool, error) {
+func startReplication(slotName string, replicationConn *pgx.ReplicationConn, sourceConn *pgx.Conn, destinationConn *pgx.Conn, tables map[string][]string, originName string, lastCommittedSourceLsn string) (chan bool, error) {
 	var err error
 
 	stop := make(chan bool)
@@ -122,9 +149,9 @@ func startReplication(slotName string, replicationConn *pgx.ReplicationConn, sou
 
 	fmt.Printf("Started replication\n")
 
-	_, err = targetConn.Exec(fmt.Sprintf("SELECT pg_replication_origin_session_setup('%s')", originName))
+	_, err = destinationConn.Exec(fmt.Sprintf("SELECT pg_replication_origin_session_setup('%s')", originName))
 	if err != nil {
-		return stop, fmt.Errorf("Failed to setup replication origin session on target: %v", err)
+		return stop, fmt.Errorf("Failed to setup replication origin session on destination: %v", err)
 	}
 
 	standbyStatusInterval := time.Duration(1 * time.Second)
@@ -174,14 +201,14 @@ func startReplication(slotName string, replicationConn *pgx.ReplicationConn, sou
 
 					if strings.HasPrefix(walString, "COMMIT") {
 						// FIXME: Replace now() with the timestamp from the COMMIT message (when running with include-timestamps)
-						_, err = targetConn.Exec(fmt.Sprintf("SELECT pg_replication_origin_xact_setup('%s', now()); SELECT txid_current();", pgx.FormatLSN(message.WalMessage.WalStart)))
+						_, err = destinationConn.Exec(fmt.Sprintf("SELECT pg_replication_origin_xact_setup('%s', now()); SELECT txid_current();", pgx.FormatLSN(message.WalMessage.WalStart)))
 						if err != nil {
-							fmt.Printf("Could not setup replication origin for transaction on target: %s", err)
+							fmt.Printf("Could not setup replication origin for transaction on destination: %s", err)
 							os.Exit(1)
 						}
 					}
 
-					err = handleDecodingMessage(walString, targetConn, tables, &stats)
+					err = handleDecodingMessage(walString, destinationConn, tables, &stats)
 					if err != nil {
 						fmt.Printf("Failed to handle WAL message: %s\n", err)
 						os.Exit(1)
@@ -200,15 +227,15 @@ func startReplication(slotName string, replicationConn *pgx.ReplicationConn, sou
 				var lsnStr string
 				var lsn uint64
 
-				err = targetConn.QueryRow("SELECT COALESCE(pg_replication_origin_session_progress(true), '0/0')").Scan(&lsnStr)
+				err = destinationConn.QueryRow("SELECT COALESCE(pg_replication_origin_session_progress(true), '0/0')").Scan(&lsnStr)
 				if err != nil {
-					fmt.Printf("Failed to retrieve replication origin progress from target session: %s", err)
+					fmt.Printf("Failed to retrieve replication origin progress from destination session: %s\n", err)
 					os.Exit(1)
 				}
 
 				lsn, err = pgx.ParseLSN(lsnStr)
 				if err != nil {
-					fmt.Printf("Failed to parse target session progress LSN: %s\n", err)
+					fmt.Printf("Failed to parse destination session progress LSN: %s\n", err)
 					os.Exit(1)
 				}
 
@@ -225,21 +252,54 @@ func startReplication(slotName string, replicationConn *pgx.ReplicationConn, sou
 	return stop, nil
 }
 
+type flagMultiString []string
+
+func (fms *flagMultiString) String() string {
+	return ""
+}
+
+func (fms *flagMultiString) Set(str string) error {
+	*fms = append(*fms, str)
+	return nil
+}
+
 func main() {
 	var slotName string
 	var originName string
 	var sourceURL string
-	var targetURL string
+	var destinationURL string
 	var resync bool
 	var clean bool
+	var skipInitialSync bool
+	var parallelDump uint32
+	var parallelRestore uint32
+	var tmpDir string
+	var includedTables flagMultiString
+	var excludedTables flagMultiString
 
-	flag.StringVar(&slotName, "slot", "pg_warp", "name of the logical replication slot on the source database")
-	flag.StringVar(&originName, "origin", "pg_warp", "name of the replication origin on the target database")
+	flag.BoolVar(&skipInitialSync, "skip-initial-sync", false, "Skips initial sync (base backup) and directly starts replication")
+	flag.StringVar(&slotName, "slot", "pg_warp", "Name of the logical replication slot on the source database")
+	flag.StringVar(&originName, "origin", "pg_warp", "Name of the replication origin on the destination database")
 	flag.StringVarP(&sourceURL, "source", "s", "", "postgres:// connection string for the source database (user needs replication privileges)")
-	flag.StringVarP(&targetURL, "target", "t", "", "postgres:// connection string for the target database")
+	flag.StringVarP(&destinationURL, "destination", "d", "", "postgres:// connection string for the destination database")
+	flag.Uint32Var(&parallelDump, "parallel-dump", 1, "Number of parallel operations whilst dumping the initial sync data (default 1 = not parallel)")
+	flag.Uint32Var(&parallelRestore, "parallel-restore", 1, "Number of parallel operations whilst restoring the initial sync data (default 1 = not parallel)")
+	flag.StringVar(&tmpDir, "tmp-dir", "", "Directory where we store temporary files (e.g. for parallel operations), this needs to be fast and have space for your full data set")
 	flag.BoolVar(&resync, "resync", false, "Resynchronize replication with a new base backup")
-	flag.BoolVar(&clean, "clean", false, "Cleans replication slot on source, and replication origin on target (run this after you don't need replication anymore)")
+	flag.BoolVar(&clean, "clean", false, "Cleans replication slot on source, and replication origin on destination (run this after you don't need replication anymore)")
+	flag.VarP(&includedTables, "table", "t", "dump, restore and replicate the named table(s) only")
+	flag.VarP(&excludedTables, "exclude-table", "T", "do NOT dump, restore and replicate the named table(s)")
 	flag.Parse()
+
+	if sourceURL == "" || destinationURL == "" {
+		fmt.Printf("ERROR: You need to specify both a source (-s) and destination (-d) database\n")
+		return
+	}
+
+	if (parallelDump > 1 || parallelRestore > 1) && tmpDir == "" {
+		fmt.Printf("ERROR: You need to specify --tmp-dir when using parallel dump or restore options\nHINT: Pick a fast disk that has enough space for your full data set\n")
+		return
+	}
 
 	sourceConnConfig, err := pgx.ParseURI(sourceURL)
 	if err != nil {
@@ -276,31 +336,51 @@ func main() {
 			fmt.Printf("ERROR: %s\n", err)
 			return
 		}
-		tables[table] = cols
+		skip := false
+		if len(includedTables) > 0 {
+			skip = true
+			for _, includedTable := range includedTables {
+				if includedTable == table {
+					skip = false
+				}
+			}
+		}
+		if len(excludedTables) > 0 {
+			for _, excludedTable := range excludedTables {
+				if excludedTable == table {
+					skip = true
+				}
+			}
+		}
+		if !skip {
+			tables[table] = cols
+		}
 	}
 
-	targetConnConfig, err := pgx.ParseURI(targetURL)
+	destinationConnConfig, err := pgx.ParseURI(destinationURL)
 	if err != nil {
-		fmt.Printf("Could not parse target connection URI: %v\n", err)
+		fmt.Printf("Could not parse destination connection URI: %v\n", err)
 		return
 	}
-	targetConnConfig.RuntimeParams["application_name"] = "pg_warp"
-	targetConn, err := pgx.Connect(targetConnConfig)
+	// pgx misinterprets sslmode=require as sslmode=verify-full (and fails typically because it misses the CA)
+	destinationConnConfig.TLSConfig.InsecureSkipVerify = true
+	destinationConnConfig.RuntimeParams["application_name"] = "pg_warp"
+	destinationConn, err := pgx.Connect(destinationConnConfig)
 	if err != nil {
-		fmt.Printf("Unable to establish target SQL connection: %v\n", err)
+		fmt.Printf("Unable to establish destination SQL connection: %v\n", err)
 		return
 	}
-	defer targetConn.Close()
+	defer destinationConn.Close()
 
 	// Disable synchronous commit to optimize performance on EBS-backed databases
-	_, err = targetConn.Exec("SET synchronous_commit = off")
+	_, err = destinationConn.Exec("SET synchronous_commit = off")
 	if err != nil {
 		fmt.Printf("Could not disable synchronous_commit: %s\n", err)
 		return
 	}
 
 	// Disable Citus deadlock prevention to allow multi-shard modifications
-	_, err = targetConn.Exec("SET citus.enable_deadlock_prevention = off")
+	_, err = destinationConn.Exec("SET citus.enable_deadlock_prevention = off")
 	if err != nil {
 		fmt.Printf("Could not disable citus.enable_deadlock_prevention: %s\n", err)
 		return
@@ -313,10 +393,10 @@ func main() {
 	}
 	defer replicationConn.Close()
 
-	// Support public.pg_replication_origin security definer functions on target
-	_, err = targetConn.Exec("SET search_path = public, pg_catalog")
+	// Support public.pg_replication_origin security definer functions on destination
+	_, err = destinationConn.Exec("SET search_path = public, pg_catalog")
 	if err != nil {
-		fmt.Printf("Could not set search path on target: %s\n", err)
+		fmt.Printf("Could not set search path on destination: %s\n", err)
 		return
 	}
 
@@ -329,15 +409,15 @@ func main() {
 			return
 		}
 
-		_, err = targetConn.Exec(fmt.Sprintf("SELECT pg_replication_origin_drop('%s')", originName))
+		_, err = destinationConn.Exec(fmt.Sprintf("SELECT pg_replication_origin_drop('%s')", originName))
 		if err != nil && !strings.HasPrefix(err.Error(), fmt.Sprintf("ERROR: cache lookup failed for replication origin '%s'", originName)) {
 			fmt.Printf("Error dropping replication origin: %s\n", err)
 			return
 		}
 	} else {
-		err = targetConn.QueryRow(fmt.Sprintf("SELECT COALESCE(pg_replication_origin_progress('%s', true), '0/0')", originName)).Scan(&lastCommittedSourceLsn)
+		err = destinationConn.QueryRow(fmt.Sprintf("SELECT COALESCE(pg_replication_origin_progress('%s', true), '0/0')", originName)).Scan(&lastCommittedSourceLsn)
 		if err != nil && !strings.HasPrefix(err.Error(), "ERROR: cache lookup failed for replication origin") {
-			fmt.Printf("Failed to retrieve replication origin progress from target: %s", err)
+			fmt.Printf("Failed to retrieve replication origin progress from destination: %s\n", err)
 			os.Exit(1)
 		}
 	}
@@ -357,25 +437,27 @@ func main() {
 			return
 		}
 
-		fmt.Printf("Truncating target tables...\n")
-		err = truncateTargetTables(targetConn, tables)
-		if err != nil {
-			fmt.Printf("Target truncate failed: %s\n", err)
-			return
-		}
-
-		fmt.Printf("Making base backup...\n")
-		err = makeBaseBackup(sourceURL, targetURL, snapshotName)
-		if err != nil {
-			fmt.Printf("Base backup failed: %s\n", err)
-			err = replicationConn.DropReplicationSlot(slotName)
+		if !skipInitialSync {
+			fmt.Printf("Truncating destination tables...\n")
+			err = truncateDestinationTables(destinationConn, tables)
 			if err != nil {
-				fmt.Printf("Error dropping replication slot: %s\n", err)
+				fmt.Printf("Destination truncate failed: %s\n", err)
+				return
 			}
-			return
+
+			fmt.Printf("Making base backup...\n")
+			err = makeBaseBackup(sourceURL, destinationURL, snapshotName, parallelDump, parallelRestore, tmpDir, []string(includedTables), []string(excludedTables))
+			if err != nil {
+				fmt.Printf("Base backup failed: %s\n", err)
+				err = replicationConn.DropReplicationSlot(slotName)
+				if err != nil {
+					fmt.Printf("Error dropping replication slot: %s\n", err)
+				}
+				return
+			}
 		}
 
-		_, err = targetConn.Exec(fmt.Sprintf("SELECT pg_replication_origin_create('%s')", originName))
+		_, err = destinationConn.Exec(fmt.Sprintf("SELECT pg_replication_origin_create('%s')", originName))
 		if err != nil {
 			fmt.Printf("%s\n", err)
 			return
@@ -387,7 +469,7 @@ func main() {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
 
-	stop, err := startReplication(slotName, replicationConn, sourceConn, targetConn, tables, originName, lastCommittedSourceLsn)
+	stop, err := startReplication(slotName, replicationConn, sourceConn, destinationConn, tables, originName, lastCommittedSourceLsn)
 	if err != nil {
 		fmt.Printf("%s\n", err)
 		return

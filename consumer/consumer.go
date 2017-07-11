@@ -181,7 +181,10 @@ func Decode(message string, replicaIdentities map[string][]string) (string, stri
 		}
 
 		targetRelation := parseResult.relation
-		replicaIdentity := replicaIdentities[targetRelation]
+		replicaIdentity, ok := replicaIdentities[targetRelation]
+		if !ok {
+			return "", ""
+		}
 		action := parseResult.action
 
 		columnNames := []string{}
