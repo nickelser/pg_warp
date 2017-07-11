@@ -35,7 +35,7 @@ func makeBaseBackup(sourceURL string, destinationURL string, snapshotName string
 		dumpCommand += " -t" + includeTable
 	}
 	for _, excludeTable := range excludedTables {
-		dumpCommand += " -t" + excludeTable
+		dumpCommand += " -T" + excludeTable
 	}
 
 	if parallelDump > 1 || parallelRestore > 1 {
