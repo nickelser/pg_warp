@@ -340,14 +340,14 @@ func main() {
 		if len(includedTables) > 0 {
 			skip = true
 			for _, includedTable := range includedTables {
-				if includedTable == table {
+				if includedTable == table || "public."+includedTable == table {
 					skip = false
 				}
 			}
 		}
 		if len(excludedTables) > 0 {
 			for _, excludedTable := range excludedTables {
-				if excludedTable == table {
+				if excludedTable == table || "public."+excludedTable == table {
 					skip = true
 				}
 			}
