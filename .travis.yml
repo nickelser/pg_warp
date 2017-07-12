@@ -2,9 +2,11 @@ language: go
 go:
 - 1.8
 deploy:
+  skip_cleanup: true
   provider: releases
   api_key:
     secure: Llm+VwHztUQhEHVxEEwwX4b3x8EJ3BABvdJRpMVsI8XYWSCIvYSXBgJe5u7gvgOvzG+BM2fivsu6cOl+O5l9dSg7IdfVtXwulYT01hHRAFjsGO4gm/T4jppc87DVB67P1Nb0qrF1chTwoojHg+mrt5l7QdGSCwlAzdHHnWafFONhvUoajugdEQsmLVlflvS7Qb7m8HIi3MuqxbpIj7QAah5kEr3n2M11aC1Xm2vysrSuaEHED/snoqf+qCWLqUsR9vUjh1bklUq5N4NpaoBymlvCyz5GW5nGBktpt27BjJUtITeBiPHspk8t4Nc9fVDGYpcbID/qLafGAXc1nWJIwQXr6Z8WqB07s2Peq1cB0L/+ZJ7a+N9ulhWE8+GHk1LDOQDM0gP0eN0fybhW9uG8Vx9w6AdIBm1zkzDKrnBMVD7t62Y+/buAyeHSgFgnZf6hec+Z+8h+VKCLlYe4y8n/qfDeOzyuexVFuvQ4BcUy9ONtMs2IOWWSizt/so1Kqc4tdlv0m5IJk5EGJlL5V89VCYS1vSpTnVr8QLkccFBsP270RalaaqajT7NnY2+i2W2PwQhooxLe/D0/LDhTxMF/OrQ9vMQEpdSSmIrvlwRvH1RRcU4xluB0xnaN+Jjt1CzJylW9Fu9ze/IRJgf4lvzUjiZDCzoRRzSvim3W3848p/g=
   file: pg_warp
   on:
     repo: citusdata/pg_warp
+    tags: true
