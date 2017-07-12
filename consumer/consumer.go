@@ -9,6 +9,7 @@ const (
 	parseStateNull              = iota
 	parseStateEscapedIdentifier = iota
 	parseStateEscapedLiteral    = iota
+	parseStateOpenSquareBracket = iota
 	parseStateEnd               = iota
 
 	parseStateRelation       = iota
@@ -106,7 +107,7 @@ func parseTableMessage(message string) (parseResult, error) {
 		case parseStateColumnDataType:
 			if chr == ']' {
 				if chrNext != ':' {
-					return result, fmt.Errorf("Invalid character ':' at %d", i+1)
+					return result, fmt.Errorf("Invalid character '%s' at %d", []byte{chrNext}, i+1)
 				}
 				state.currentColumn.dataType = message[state.tokenStart:i]
 				state.tokenStart = i + 2
@@ -114,6 +115,9 @@ func parseTableMessage(message string) (parseResult, error) {
 			} else if chr == '"' {
 				state.prev = state.current
 				state.current = parseStateEscapedIdentifier
+			} else if chr == '[' {
+				state.prev = state.current
+				state.current = parseStateOpenSquareBracket
 			}
 		case parseStateColumnValue:
 			if chr == '\000' {
@@ -132,6 +136,11 @@ func parseTableMessage(message string) (parseResult, error) {
 			} else if chr == '\'' {
 				state.prev = state.current
 				state.current = parseStateEscapedLiteral
+			}
+		case parseStateOpenSquareBracket:
+			if chr == ']' {
+				state.current = state.prev
+				state.prev = parseStateNull
 			}
 		case parseStateEscapedIdentifier:
 			if chr == '"' {

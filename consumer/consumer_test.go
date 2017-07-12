@@ -17,6 +17,7 @@ var decodertests = []struct {
 	{"table public.z: UPDATE: id[integer]:1 another[text]:'value'", "UPDATE public.z SET (id, another) = (1, 'value') WHERE id = 1"},
 	{"table public.z: UPDATE: old-key: id[integer]:-1000 new-tuple: id[integer]:-2000 whatever[text]:'depesz'", "UPDATE public.z SET (id, whatever) = (-2000, 'depesz') WHERE id = -1000"},
 	{"table public.xyz: UPDATE: id[integer]:1 large[text]:unchanged-toast-datum small[text]:'value'", "UPDATE public.xyz SET (id, small) = (1, 'value') WHERE id = 1"},
+	{"table public.z: UPDATE: id[integer]:4 a[character varying]:'123' b[timestamp without time zone]:'2017-01-01 00:00:00' c[json]:'{\"a\":\"b\"}' d[citext[]]:'{}' e[text[][]]:'{}'", "UPDATE public.z SET (id, a, b, c, d, e) = (4, '123', '2017-01-01 00:00:00', '{\"a\":\"b\"}', '{}', '{}') WHERE id = 4"},
 	{"table public.data: DELETE: id[int4]:2", "DELETE FROM public.data WHERE id = 2"},
 	{"table public.data: DELETE: id[int4]:3", "DELETE FROM public.data WHERE id = 3"},
 }
