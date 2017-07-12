@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.2      UNRELEASED
+## 0.1.2      2017-07-11
 
 * Improve test_decoding consumer
   - Cover additional edge cases
