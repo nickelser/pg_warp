@@ -2,6 +2,7 @@ package consumer
 
 import (
 	"fmt"
+	"os"
 	"strings"
 )
 
@@ -181,11 +182,12 @@ func Decode(message string, replicaIdentities map[string][]string) (string, stri
 	if strings.HasPrefix(message, "table ") {
 		parseResult, err := parseTableMessage(message)
 		if err != nil {
-			fmt.Printf("Parser error: %+v\n", err)
-			return "", ""
+			fmt.Printf("ERROR: Parser error: %+v\n", err)
+			fmt.Printf("HINT: Original message: %s\n", message)
+			os.Exit(1)
 		}
 		if parseResult.noTupleData {
-			fmt.Printf("No tuple data: %s\n", message)
+			fmt.Printf("WARN: No tuple data: %s\n", message)
 			return "", ""
 		}
 
@@ -235,7 +237,7 @@ func Decode(message string, replicaIdentities map[string][]string) (string, stri
 					whereClause += column.name + " = " + column.value
 				}
 				if whereClause == "" {
-					fmt.Printf("No known replica identity: %s\n", message)
+					fmt.Printf("WARN: No known replica identity: %s\n", message)
 					return "", ""
 				}
 			}
