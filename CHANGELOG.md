@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.2      UNRELEASED
+
+* Improve test_decoding consumer
+  - Cover additional edge cases
+  - Output separate UPDATE SET clauses instead of using (..) = (..) syntax
+
+
 ## 0.1.1      2017-07-11
 
 * Add support for array types in test_decoding messages

@@ -98,7 +98,7 @@ func parseTableMessage(message string) (parseResult, error) {
 					state.oldKey = false
 				}
 				state.tokenStart = i + 2
-			} else if chr == '(' && message[state.tokenStart:i] == "(no-tuple-data)" {
+			} else if chr == '(' && message[state.tokenStart:len(message)] == "(no-tuple-data)" {
 				result.noTupleData = true
 				state.current = parseStateEnd
 			} else if chr == '"' {
@@ -186,39 +186,34 @@ func Decode(message string, replicaIdentities map[string][]string) (string, stri
 			fmt.Printf("HINT: Original message: %s\n", message)
 			os.Exit(1)
 		}
-		if parseResult.noTupleData {
-			fmt.Printf("WARN: No tuple data: %s\n", message)
-			return "", ""
-		}
 
 		targetRelation := parseResult.relation
 		replicaIdentity, ok := replicaIdentities[targetRelation]
 		if !ok {
 			return "", ""
 		}
-		action := parseResult.action
 
-		columnNames := []string{}
-		columnValues := []string{}
-		for _, column := range parseResult.columns {
-			if column.value == "unchanged-toast-datum" {
-				continue
-			}
-			columnNames = append(columnNames, column.name)
-			columnValues = append(columnValues, column.value)
+		if parseResult.noTupleData {
+			fmt.Printf("WARN: Missing primary key for table %s, ignoring %s\n", targetRelation, parseResult.action)
+			fmt.Printf("HINT: Original message: %s\n", message)
+			return "", ""
 		}
 
-		switch action {
+		switch parseResult.action {
 		case "INSERT":
+			columnNames := []string{}
+			columnValues := []string{}
+			for _, column := range parseResult.columns {
+				columnNames = append(columnNames, column.name)
+				columnValues = append(columnValues, column.value)
+			}
 			return fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", targetRelation, strings.Join(columnNames, ", "), strings.Join(columnValues, ", ")), "INSERT"
 		case "UPDATE":
-			whereClause := ""
+			setClauses := []string{}
+			whereClauses := []string{}
 			if len(parseResult.oldKey) > 0 {
 				for _, column := range parseResult.oldKey {
-					if whereClause != "" {
-						whereClause += " AND "
-					}
-					whereClause += column.name + " = " + column.value
+					whereClauses = append(whereClauses, column.name+" = "+column.value)
 				}
 			} else {
 				for _, column := range parseResult.columns {
@@ -231,27 +226,40 @@ func Decode(message string, replicaIdentities map[string][]string) (string, stri
 					if !identityColumn {
 						continue
 					}
-					if whereClause != "" {
-						whereClause += " AND "
-					}
-					whereClause += column.name + " = " + column.value
+					whereClauses = append(whereClauses, column.name+" = "+column.value)
 				}
-				if whereClause == "" {
-					fmt.Printf("WARN: No known replica identity: %s\n", message)
+				if len(whereClauses) == 0 {
+					fmt.Printf("WARN: Missing primary key for table %s, ignoring %s\n", targetRelation, parseResult.action)
+					fmt.Printf("HINT: Original message: %s\n", message)
 					return "", ""
 				}
 			}
-			return fmt.Sprintf("UPDATE %s SET (%s) = (%s) WHERE %s", targetRelation, strings.Join(columnNames, ", "), strings.Join(columnValues, ", "), whereClause), "UPDATE"
+
+			for _, column := range parseResult.columns {
+				if column.value == "unchanged-toast-datum" {
+					continue
+				}
+				if len(parseResult.oldKey) == 0 {
+					identityColumn := false
+					for _, identityColumnName := range replicaIdentity {
+						if column.name == identityColumnName {
+							identityColumn = true
+						}
+					}
+					if identityColumn {
+						continue
+					}
+				}
+				setClauses = append(setClauses, column.name+" = "+column.value)
+			}
+			return fmt.Sprintf("UPDATE %s SET %s WHERE %s", targetRelation, strings.Join(setClauses, ", "), strings.Join(whereClauses, " AND ")), "UPDATE"
 		case "DELETE":
 			// The column/data values here are the replica identity (i.e. what we want to match on)
-			whereClause := ""
+			whereClauses := []string{}
 			for _, column := range parseResult.columns {
-				if whereClause != "" {
-					whereClause += " AND "
-				}
-				whereClause += column.name + " = " + column.value
+				whereClauses = append(whereClauses, column.name+" = "+column.value)
 			}
-			return fmt.Sprintf("DELETE FROM %s WHERE %s", targetRelation, whereClause), "DELETE"
+			return fmt.Sprintf("DELETE FROM %s WHERE %s", targetRelation, strings.Join(whereClauses, " AND ")), "DELETE"
 		}
 	}
 	return "", ""
