@@ -2,9 +2,15 @@
 
 pg_warp makes it easy to logically replicate data from a source Postgres instance with the [test_decoding](https://www.postgresql.org/docs/9.6/static/test-decoding.html) logical decoding plugin to a target Postgres instance, including distributed Postgres running on Citus Cloud.
 
-Contrary to other logical replication solutions, this test_decoding-based approach has little overhead on the source database, and resembles the logical replication that PostgreSQL 10 will include. The necessary test_decoding plugin has been part of PostgreSQL since version 9.4 and is considered stable and safe to use on production systems.
+pg_warp first takes a base backup using standard Postgres tooling, and then consistently replays any changes that were made after the consistent snapshot used for the base backup.
 
-It first takes a base backup using standard Postgres tooling, and then consistently replays any changes that were made after the consistent snapshot used for the base backup.
+Contrary to other logical replication solutions, this test_decoding-based approach has little overhead on the source database, and resembles the native logical replication feature in PostgreSQL 10.
+
+The necessary test_decoding plugin has been part of PostgreSQL since version 9.4 and is considered stable and safe to use on production systems.
+
+Through the use of [replication slots](https://www.postgresql.org/docs/9.6/static/warm-standby.html#STREAMING-REPLICATION-SLOTS) and [replication origins](https://www.postgresql.org/docs/9.6/static/replication-origins.html) pg_warp is able to recover from crashes of the replication tool itself, by simply starting the command up again with the same source and destination instance.
+
+Unlike other tooling, pg_warp has no restrictions or issues with the use of complex data types, or large JSON, JSONB or hstore columns.
 
 ## Usage
 
