@@ -48,6 +48,22 @@ func makeBaseBackup(sourceURL string, destinationURL string, snapshotName string
 		dumpCommand += fmt.Sprintf("-Fd -j %d -f %s", parallelDump, dumpDir)
 		restoreCommand += fmt.Sprintf("-Fd -j%d %s", parallelRestore, dumpDir)
 
+		cmd := exec.Command("/bin/sh", "-c", dumpCommand)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stdout
+		err = cmd.Run()
+		if err != nil {
+			return fmt.Errorf("Error dumping data: %s\n", err)
+		}
+
+		cmd = exec.Command("/bin/sh", "-c", restoreCommand)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stdout
+		err = cmd.Run()
+		if err != nil {
+			return fmt.Errorf("Error restoring data: %s\n", err)
+		}
+
 		err = os.RemoveAll(dumpDir)
 		if err != nil {
 			return fmt.Errorf("Could not remove dump directory: %s\n", err)
