@@ -284,7 +284,7 @@ func main() {
 	flag.StringVarP(&destinationURL, "destination", "d", "", "postgres:// connection string for the destination database")
 	flag.Uint32Var(&parallelDump, "parallel-dump", 1, "Number of parallel operations whilst dumping the initial sync data (default 1 = not parallel)")
 	flag.Uint32Var(&parallelRestore, "parallel-restore", 1, "Number of parallel operations whilst restoring the initial sync data (default 1 = not parallel)")
-	flag.StringVar(&tmpDir, "tmp-dir", "", "Directory where we store temporary files (e.g. for parallel operations), this needs to be fast and have space for your full data set")
+	flag.StringVar(&tmpDir, "tmp-dir", "", "Directory where we store temporary files as part of parallel operations (this needs to be fast and have space for your full data set)")
 	flag.BoolVar(&resync, "resync", false, "Resynchronize replication with a new base backup")
 	flag.BoolVar(&clean, "clean", false, "Cleans replication slot on source, and replication origin on destination (run this after you don't need replication anymore)")
 	flag.VarP(&includedTables, "table", "t", "dump, restore and replicate the named table(s) only")
