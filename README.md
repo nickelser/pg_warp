@@ -66,6 +66,7 @@ The following configuration is required to enable logical decoding and replicati
 ```
 wal_level = logical
 max_replication_slots = 5
+max_wal_senders = 5
 ```
 
 ## Required Postgres configuration on the target
