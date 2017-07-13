@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.3      2017-07-13
+
+* Fix issue with running dump/restore in parallel mode
+
+
 ## 0.1.2      2017-07-11
 
 * Improve test_decoding consumer
