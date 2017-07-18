@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.4      2017-07-18
+
+* Support Postgres versions before 9.6
+
+
 ## 0.1.3      2017-07-13
 
 * Fix issue with running dump/restore in parallel mode
