@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.0      2017-07-18
+
+* Run truncate with all tables at once, to avoid problems with foreign keys
+* Add --sync-schema option to perform a full restore
+* Cleanup error messages and include timestamp in progress reporting
+
+
 ## 0.1.4      2017-07-18
 
 * Support Postgres versions before 9.6
