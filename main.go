@@ -18,10 +18,16 @@ import (
 )
 
 func truncateDestinationTables(destinationConn *pgx.Conn, tables map[string][]string) error {
+	truncateTables := []string{}
 	for table := range tables {
-		_, err := destinationConn.Exec(fmt.Sprintf("TRUNCATE %s", table))
+		truncateTables = append(truncateTables, table)
+	}
+
+	if len(truncateTables) > 0 {
+		sql := fmt.Sprintf("TRUNCATE %s", strings.Join(truncateTables, ", "))
+		_, err := destinationConn.Exec(sql)
 		if err != nil {
-			return fmt.Errorf("Failed to truncate %s on destination: %s", table, err)
+			return fmt.Errorf("Failed to truncate on destination: %s\nSQL: %s", err, sql)
 		}
 	}
 	return nil
