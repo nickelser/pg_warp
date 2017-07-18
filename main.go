@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -34,12 +35,17 @@ func truncateDestinationTables(destinationConn *pgx.Conn, tables map[string][]st
 }
 
 func printProgress(message string) {
-	fmt.Printf("%s %s\n", time.Now().Format(time.RFC822), message)
+	fmt.Printf("%s: %s\n", time.Now().Format("2006-01-02 15:04:05.000 MST"), message)
 }
 
-func makeInitialBackup(sourceURL string, destinationURL string, snapshotName string, parallelDump uint32, parallelRestore uint32, tmpDir string, includedTables []string, excludedTables []string) error {
+func makeInitialBackup(sourceURL string, destinationURL string, snapshotName string, syncSchema bool, parallelDump uint32, parallelRestore uint32, tmpDir string, includedTables []string, excludedTables []string) error {
 	dumpCommand := fmt.Sprintf("pg_dump --snapshot=%s -d %s", snapshotName, sourceURL)
-	restoreCommand := fmt.Sprintf("pg_restore --data-only --no-acl --no-owner -d %s", destinationURL)
+	restoreCommand := fmt.Sprintf("pg_restore --no-acl --no-owner -d %s", destinationURL)
+	if syncSchema {
+		restoreCommand += " --clean"
+	} else {
+		restoreCommand += " --data-only"
+	}
 
 	for _, includeTable := range includedTables {
 		dumpCommand += " -t" + includeTable
@@ -48,7 +54,7 @@ func makeInitialBackup(sourceURL string, destinationURL string, snapshotName str
 		dumpCommand += " -T" + excludeTable
 	}
 
-	if parallelDump > 1 || parallelRestore > 1 {
+	if parallelDump > 1 || parallelRestore > 1 || syncSchema {
 		dumpDir := path.Join(tmpDir, "dump")
 		err := os.MkdirAll(dumpDir, 0755)
 		if err != nil {
@@ -58,8 +64,11 @@ func makeInitialBackup(sourceURL string, destinationURL string, snapshotName str
 		dumpCommand += fmt.Sprintf(" -Fd -j %d -f %s", parallelDump, dumpDir)
 		restoreCommand += fmt.Sprintf(" -Fd -j%d %s", parallelRestore, dumpDir)
 
-		printProgress("Running initial backup dump (parallel)...")
-
+		if parallelDump > 1 {
+			printProgress(fmt.Sprintf("Running initial backup dump (%d parallel jobs)...", parallelDump))
+		} else {
+			printProgress("Running initial backup dump...")
+		}
 		cmd := exec.Command("/bin/sh", "-c", dumpCommand)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stdout
@@ -68,8 +77,52 @@ func makeInitialBackup(sourceURL string, destinationURL string, snapshotName str
 			return fmt.Errorf("Error dumping data: %s\n", err)
 		}
 
-		printProgress("Running initial backup restore (parallel)...")
+		// For schema+data dumps we need to filter out bogus entries from the ToC
+		// that would require superuser access on the destination database
+		if syncSchema {
+			var out []byte
 
+			out, err = exec.Command("/bin/sh", "-c", fmt.Sprintf("pg_restore -l -Fd %s", dumpDir)).Output()
+			if err != nil {
+				return fmt.Errorf("Error writing pg_restore ToC file: %s\n", err)
+			}
+
+			tocIn := strings.Split(string(out), "\n")
+			tocOut := []string{}
+			for _, tocLine := range tocIn {
+				if strings.HasPrefix(tocLine, ";") {
+					continue
+				}
+				parts := strings.SplitN(tocLine, " ", 5)
+				if len(parts) < 5 {
+					continue
+				}
+				switch parts[3] {
+				case "ACL", "COMMENT", "DATABASE", "EXTENSION":
+					continue
+				case "SCHEMA":
+					if strings.HasPrefix(parts[4], "- public") {
+						continue
+					}
+				}
+				tocOut = append(tocOut, tocLine)
+			}
+
+			tocPath := path.Join(tmpDir, "pg_restore_toc")
+			err = ioutil.WriteFile(tocPath, []byte(strings.Join(tocOut, "\n")), 0744)
+			if err != nil {
+				return fmt.Errorf("Error writing ToC for pg_restore: %s\n", err)
+			}
+
+			defer os.Remove(tocPath)
+			restoreCommand += " -L" + tocPath
+		}
+
+		if parallelRestore > 1 {
+			printProgress(fmt.Sprintf("Running initial backup restore (%d parallel jobs)...", parallelRestore))
+		} else {
+			printProgress("Running initial backup restore...")
+		}
 		cmd = exec.Command("/bin/sh", "-c", restoreCommand)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stdout
@@ -307,6 +360,7 @@ func main() {
 	var resync bool
 	var clean bool
 	var skipInitialSync bool
+	var syncSchema bool
 	var parallelDump uint32
 	var parallelRestore uint32
 	var tmpDir string
@@ -314,6 +368,7 @@ func main() {
 	var excludedTables flagMultiString
 
 	flag.BoolVar(&skipInitialSync, "skip-initial-sync", false, "Skips initial sync (initial backup) and directly starts replication")
+	flag.BoolVar(&syncSchema, "sync-schema", false, "Include schema in the initial backup process (this will remove any existing objects on the target)")
 	flag.StringVar(&slotName, "slot", "pg_warp", "Name of the logical replication slot on the source database")
 	flag.StringVar(&originName, "origin", "pg_warp", "Name of the replication origin on the destination database")
 	flag.StringVarP(&sourceURL, "source", "s", "", "postgres:// connection string for the source database (user needs replication privileges)")
@@ -332,8 +387,8 @@ func main() {
 		return
 	}
 
-	if (parallelDump > 1 || parallelRestore > 1) && tmpDir == "" {
-		fmt.Printf("ERROR: You need to specify --tmp-dir when using parallel dump or restore options\nHINT: Pick a fast disk that has enough space for your full data set\n")
+	if (parallelDump > 1 || parallelRestore > 1 || syncSchema) && tmpDir == "" {
+		fmt.Printf("ERROR: You need to specify --tmp-dir when using parallel options or --sync-schema\nHINT: Pick a fast disk that has enough space for your full data set\n")
 		return
 	}
 
@@ -474,14 +529,16 @@ func main() {
 		}
 
 		if !skipInitialSync {
-			printProgress("Truncating destination tables...")
-			err = truncateDestinationTables(destinationConn, tables)
-			if err != nil {
-				fmt.Printf("ERROR: Destination truncate failed: %s\n", err)
-				return
+			if !syncSchema {
+				printProgress("Truncating destination tables...")
+				err = truncateDestinationTables(destinationConn, tables)
+				if err != nil {
+					fmt.Printf("ERROR: Destination truncate failed: %s\n", err)
+					return
+				}
 			}
 
-			err = makeInitialBackup(sourceURL, destinationURL, snapshotName, parallelDump, parallelRestore, tmpDir, []string(includedTables), []string(excludedTables))
+			err = makeInitialBackup(sourceURL, destinationURL, snapshotName, syncSchema, parallelDump, parallelRestore, tmpDir, []string(includedTables), []string(excludedTables))
 			if err != nil {
 				fmt.Printf("ERROR: Initial backup failed: %s\n", err)
 				err = replicationConn.DropReplicationSlot(slotName)
