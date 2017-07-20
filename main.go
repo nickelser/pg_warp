@@ -150,12 +150,12 @@ func makeInitialBackup(sourceURL string, destinationURL string, snapshotName str
 	return nil
 }
 
-func handleDecodingMessage(message string, destinationConn *pgx.Conn, tables map[string][]string, stats *logStats) error {
-	sql, sqlType := consumer.Decode(message, tables)
+func handleDecodingMessage(message string, destinationConn *pgx.Conn, tables map[string][]string, distributedTables map[string]string, stats *logStats) error {
+	sql, sqlType := consumer.Decode(message, tables, distributedTables)
 	if sql != "" {
 		_, err := destinationConn.Exec(sql)
 		if err != nil {
-			return fmt.Errorf("Could not apply stream to destination: %s\n  SQL: %q", err, sql)
+			return fmt.Errorf("Could not apply stream to destination: %s\n  SQL: %s", err, sql)
 		}
 	}
 	switch sqlType {
@@ -218,7 +218,7 @@ func retrieveLagAndOutputStats(sourceConn *pgx.Conn, stats logStats, maxWal uint
 		stats.txPerSecond(), stats.insertsPerSecond(), stats.updatesPerSecond(), stats.deletesPerSecond(), pgx.FormatLSN(maxWal), replicationLag))
 }
 
-func startReplication(slotName string, replicationConn *pgx.ReplicationConn, sourceConn *pgx.Conn, destinationConn *pgx.Conn, tables map[string][]string, originName string, lastCommittedSourceLsn string) (chan bool, error) {
+func startReplication(slotName string, replicationConn *pgx.ReplicationConn, sourceConn *pgx.Conn, destinationConn *pgx.Conn, tables map[string][]string, distributedTables map[string]string, originName string, lastCommittedSourceLsn string) (chan bool, error) {
 	var err error
 
 	stop := make(chan bool)
@@ -292,12 +292,12 @@ func startReplication(slotName string, replicationConn *pgx.ReplicationConn, sou
 						// FIXME: Replace now() with the timestamp from the COMMIT message (when running with include-timestamps)
 						_, err = destinationConn.Exec(fmt.Sprintf("SELECT pg_replication_origin_xact_setup('%s', now()); SELECT txid_current();", pgx.FormatLSN(message.WalMessage.WalStart)))
 						if err != nil {
-							fmt.Printf("ERROR: Could not setup replication origin for transaction on destination: %s", err)
+							fmt.Printf("ERROR: Could not setup replication origin for transaction on destination: %s\n", err)
 							os.Exit(1)
 						}
 					}
 
-					err = handleDecodingMessage(walString, destinationConn, tables, &stats)
+					err = handleDecodingMessage(walString, destinationConn, tables, distributedTables, &stats)
 					if err != nil {
 						fmt.Printf("ERROR: Failed to handle WAL message: %s\n", err)
 						os.Exit(1)
@@ -352,6 +352,158 @@ func (fms *flagMultiString) Set(str string) error {
 	return nil
 }
 
+// getPrimaryKeys - Gets primary keys from the source so we can correctly apply UPDATEs
+func getPrimaryKeys(sourceConn *pgx.Conn, includedTables []string, excludedTables []string) (map[string][]string, error) {
+	rows, err := sourceConn.Query("SELECT nspname, relname, array_agg(attname::text) FILTER (WHERE attname IS NOT NULL)" +
+		" FROM pg_class cl JOIN pg_namespace n ON (cl.relnamespace = n.oid)" +
+		" LEFT JOIN (SELECT conrelid, unnest(conkey) AS attnum FROM pg_constraint WHERE contype = 'p') co ON (cl.oid = co.conrelid)" +
+		" LEFT JOIN pg_attribute a ON (a.attnum = co.attnum AND a.attrelid = co.conrelid)" +
+		" WHERE nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') AND relpersistence = 'p' AND relkind = 'r'" +
+		" GROUP BY 1, 2")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	tables := map[string][]string{}
+	for rows.Next() {
+		var nspname string
+		var relname string
+		var cols []string
+		err = rows.Scan(&nspname, &relname, &cols)
+		if err != nil {
+			return nil, err
+		}
+		skip := false
+		if len(includedTables) > 0 {
+			skip = true
+			for _, includedTable := range includedTables {
+				if includedTable == nspname+"."+relname || includedTable == relname {
+					skip = false
+				}
+			}
+		}
+		if len(excludedTables) > 0 {
+			for _, excludedTable := range excludedTables {
+				if excludedTable == nspname+"."+relname || excludedTable == relname {
+					skip = true
+				}
+			}
+		}
+		if !skip {
+			tables[nspname+"."+relname] = cols
+		}
+	}
+	return tables, nil
+}
+
+func getDistributedTables(destinationConn *pgx.Conn, includedTables []string, excludedTables []string) (map[string]string, error) {
+	rows, err := destinationConn.Query("SELECT nspname, relname, part_key" +
+		" FROM (SELECT nspname, relname FROM pg_dist_partition" +
+		" JOIN pg_class ON (pg_class.oid = pg_dist_partition.logicalrelid)" +
+		" JOIN pg_namespace ON (pg_namespace.oid = pg_class.relnamespace)) AS rels," +
+		" master_get_table_metadata(nspname || '.' || relname)" +
+		" WHERE part_key IS NOT NULL")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	partKeyByTable := map[string]string{}
+	for rows.Next() {
+		var nspname string
+		var relname string
+		var partKey string
+		err = rows.Scan(&nspname, &relname, &partKey)
+		if err != nil {
+			return nil, err
+		}
+		skip := false
+		if len(includedTables) > 0 {
+			skip = true
+			for _, includedTable := range includedTables {
+				if includedTable == nspname+"."+relname || includedTable == relname {
+					skip = false
+				}
+			}
+		}
+		if len(excludedTables) > 0 {
+			for _, excludedTable := range excludedTables {
+				if excludedTable == nspname+"."+relname || excludedTable == relname {
+					skip = true
+				}
+			}
+		}
+		if !skip {
+			partKeyByTable[nspname+"."+relname] = partKey
+		}
+	}
+	return partKeyByTable, nil
+}
+
+func openSourceConn(sourceURL string) (*pgx.Conn, *pgx.ReplicationConn, error) {
+	sourceConnConfig, err := pgx.ParseURI(sourceURL)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// pgx misinterprets sslmode=require as sslmode=verify-full (and fails typically because it misses the CA)
+	sourceConnConfig.TLSConfig.InsecureSkipVerify = true
+	sourceConnConfig.RuntimeParams["application_name"] = "pg_warp"
+
+	sourceConn, err := pgx.Connect(sourceConnConfig)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	replicationConn, err := pgx.ReplicationConnect(sourceConnConfig)
+	if err != nil {
+		sourceConn.Close()
+		return nil, nil, fmt.Errorf("Could not open replication connection: %v", err)
+	}
+
+	return sourceConn, replicationConn, nil
+}
+
+func openDestinationConn(destinationURL string) (*pgx.Conn, error) {
+	destinationConnConfig, err := pgx.ParseURI(destinationURL)
+	if err != nil {
+		return nil, err
+	}
+
+	// pgx misinterprets sslmode=require as sslmode=verify-full (and fails typically because it misses the CA)
+	destinationConnConfig.TLSConfig.InsecureSkipVerify = true
+	destinationConnConfig.RuntimeParams["application_name"] = "pg_warp"
+
+	destinationConn, err := pgx.Connect(destinationConnConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	// Disable synchronous commit to optimize performance on EBS-backed databases
+	_, err = destinationConn.Exec("SET synchronous_commit = off")
+	if err != nil {
+		destinationConn.Close()
+		return nil, fmt.Errorf("Could not disable synchronous_commit: %s", err)
+	}
+
+	// Disable Citus deadlock prevention to allow multi-shard modifications
+	_, err = destinationConn.Exec("SET citus.enable_deadlock_prevention = off")
+	if err != nil {
+		destinationConn.Close()
+		return nil, fmt.Errorf("Could not disable citus.enable_deadlock_prevention: %s", err)
+	}
+
+	// Support public.pg_replication_origin security definer functions on destination
+	_, err = destinationConn.Exec("SET search_path = public, pg_catalog")
+	if err != nil {
+		destinationConn.Close()
+		return nil, fmt.Errorf("Could not set search path on destination: %s", err)
+	}
+
+	return destinationConn, nil
+}
+
 func main() {
 	var slotName string
 	var originName string
@@ -392,102 +544,30 @@ func main() {
 		return
 	}
 
-	sourceConnConfig, err := pgx.ParseURI(sourceURL)
+	sourceConn, replicationConn, err := openSourceConn(sourceURL)
 	if err != nil {
-		fmt.Printf("ERROR: Could not parse source connection URI: %v\n", err)
-		return
-	}
-	sourceConnConfig.RuntimeParams["application_name"] = "pg_warp"
-
-	sourceConn, err := pgx.Connect(sourceConnConfig)
-	if err != nil {
-		fmt.Printf("ERROR: Unable to establish source SQL connection: %v\n", err)
+		fmt.Printf("ERROR: Unable to establish source connection: %v\n", err)
 		return
 	}
 	defer sourceConn.Close()
+	defer replicationConn.Close()
 
-	// Get primary keys from the source so we can correctly apply UPDATEs
-	rows, err := sourceConn.Query("SELECT nspname || '.' || relname, array_agg(attname::text) FILTER (WHERE attname IS NOT NULL)" +
-		" FROM pg_class cl JOIN pg_namespace n ON (cl.relnamespace = n.oid)" +
-		" LEFT JOIN (SELECT conrelid, unnest(conkey) AS attnum FROM pg_constraint WHERE contype = 'p') co ON (cl.oid = co.conrelid)" +
-		" LEFT JOIN pg_attribute a ON (a.attnum = co.attnum AND a.attrelid = co.conrelid)" +
-		" WHERE nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') AND relpersistence = 'p' AND relkind = 'r'" +
-		" GROUP BY 1")
-	if err != nil {
-		return
-	}
-	defer rows.Close()
-
-	tables := map[string][]string{}
-	for rows.Next() {
-		var table string
-		var cols []string
-		err = rows.Scan(&table, &cols)
-		if err != nil {
-			fmt.Printf("ERROR: %s\n", err)
-			return
-		}
-		skip := false
-		if len(includedTables) > 0 {
-			skip = true
-			for _, includedTable := range includedTables {
-				if includedTable == table || "public."+includedTable == table {
-					skip = false
-				}
-			}
-		}
-		if len(excludedTables) > 0 {
-			for _, excludedTable := range excludedTables {
-				if excludedTable == table || "public."+excludedTable == table {
-					skip = true
-				}
-			}
-		}
-		if !skip {
-			tables[table] = cols
-		}
-	}
-
-	destinationConnConfig, err := pgx.ParseURI(destinationURL)
-	if err != nil {
-		fmt.Printf("ERROR: Could not parse destination connection URI: %v\n", err)
-		return
-	}
-	// pgx misinterprets sslmode=require as sslmode=verify-full (and fails typically because it misses the CA)
-	destinationConnConfig.TLSConfig.InsecureSkipVerify = true
-	destinationConnConfig.RuntimeParams["application_name"] = "pg_warp"
-	destinationConn, err := pgx.Connect(destinationConnConfig)
+	destinationConn, err := openDestinationConn(destinationURL)
 	if err != nil {
 		fmt.Printf("ERROR: Unable to establish destination SQL connection: %v\n", err)
 		return
 	}
 	defer destinationConn.Close()
 
-	// Disable synchronous commit to optimize performance on EBS-backed databases
-	_, err = destinationConn.Exec("SET synchronous_commit = off")
+	tables, err := getPrimaryKeys(sourceConn, includedTables, excludedTables)
 	if err != nil {
-		fmt.Printf("ERROR: Could not disable synchronous_commit: %s\n", err)
+		fmt.Printf("ERROR: Could not determine primary keys on source: %v\n", err)
 		return
 	}
 
-	// Disable Citus deadlock prevention to allow multi-shard modifications
-	_, err = destinationConn.Exec("SET citus.enable_deadlock_prevention = off")
+	distributedTables, err := getDistributedTables(destinationConn, includedTables, excludedTables)
 	if err != nil {
-		fmt.Printf("ERROR: Could not disable citus.enable_deadlock_prevention: %s\n", err)
-		return
-	}
-
-	replicationConn, err := pgx.ReplicationConnect(sourceConnConfig)
-	if err != nil {
-		fmt.Printf("ERROR: Unable to establish source replication connection: %v\n", err)
-		return
-	}
-	defer replicationConn.Close()
-
-	// Support public.pg_replication_origin security definer functions on destination
-	_, err = destinationConn.Exec("SET search_path = public, pg_catalog")
-	if err != nil {
-		fmt.Printf("ERROR: Could not set search path on destination: %s\n", err)
+		fmt.Printf("ERROR: Could not determine distributed tables on destination: %v\n", err)
 		return
 	}
 
@@ -561,7 +641,7 @@ func main() {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
 
-	stop, err := startReplication(slotName, replicationConn, sourceConn, destinationConn, tables, originName, lastCommittedSourceLsn)
+	stop, err := startReplication(slotName, replicationConn, sourceConn, destinationConn, tables, distributedTables, originName, lastCommittedSourceLsn)
 	if err != nil {
 		fmt.Printf("%s\n", err)
 		return

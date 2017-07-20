@@ -128,7 +128,7 @@ func parseTableMessage(message string) (parseResult, error) {
 			} else if chr == ' ' {
 				state.currentColumn.value = message[state.tokenStart:i]
 				if state.oldKey {
-					result.oldKey = append(result.columns, state.currentColumn)
+					result.oldKey = append(result.oldKey, state.currentColumn)
 				} else {
 					result.columns = append(result.columns, state.currentColumn)
 				}
@@ -171,7 +171,7 @@ func parseTableMessage(message string) (parseResult, error) {
 	return result, nil
 }
 
-func Decode(message string, replicaIdentities map[string][]string) (string, string) {
+func Decode(message string, replicaIdentities map[string][]string, distributedTables map[string]string) (string, string) {
 	if strings.HasPrefix(message, "BEGIN") {
 		return "BEGIN", "BEGIN"
 	}
@@ -209,11 +209,23 @@ func Decode(message string, replicaIdentities map[string][]string) (string, stri
 			}
 			return fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", targetRelation, strings.Join(columnNames, ", "), strings.Join(columnValues, ", ")), "INSERT"
 		case "UPDATE":
+			partitionColumn, isDistributed := distributedTables[targetRelation]
 			setClauses := []string{}
 			whereClauses := []string{}
-			if len(parseResult.oldKey) > 0 {
+			if len(parseResult.oldKey) != 0 {
+				partitionColumnIncluded := false
 				for _, column := range parseResult.oldKey {
 					whereClauses = append(whereClauses, column.name+" = "+column.value)
+					if isDistributed && column.name == partitionColumn {
+						partitionColumnIncluded = true
+					}
+				}
+				if isDistributed && !partitionColumnIncluded {
+					for _, column := range parseResult.columns {
+						if column.name == partitionColumn {
+							whereClauses = append(whereClauses, column.name+" = "+column.value)
+						}
+					}
 				}
 			} else {
 				for _, column := range parseResult.columns {
@@ -222,6 +234,9 @@ func Decode(message string, replicaIdentities map[string][]string) (string, stri
 						if column.name == identityColumnName {
 							identityColumn = true
 						}
+					}
+					if isDistributed && column.name == partitionColumn {
+						identityColumn = true
 					}
 					if !identityColumn {
 						continue
@@ -237,6 +252,9 @@ func Decode(message string, replicaIdentities map[string][]string) (string, stri
 
 			for _, column := range parseResult.columns {
 				if column.value == "unchanged-toast-datum" {
+					continue
+				}
+				if isDistributed && column.name == partitionColumn {
 					continue
 				}
 				if len(parseResult.oldKey) == 0 {
@@ -259,7 +277,23 @@ func Decode(message string, replicaIdentities map[string][]string) (string, stri
 			for _, column := range parseResult.columns {
 				whereClauses = append(whereClauses, column.name+" = "+column.value)
 			}
-			return fmt.Sprintf("DELETE FROM %s WHERE %s", targetRelation, strings.Join(whereClauses, " AND ")), "DELETE"
+			sql := fmt.Sprintf("DELETE FROM %s WHERE %s", targetRelation, strings.Join(whereClauses, " AND "))
+
+			// Handle special case where the destination has the partition column in the
+			// primary key, but the source does not
+			partitionColumn, isDistributed := distributedTables[targetRelation]
+			if isDistributed {
+				modifiesMultipleShards := true
+				for _, column := range parseResult.columns {
+					if column.name == partitionColumn {
+						modifiesMultipleShards = false
+					}
+				}
+				if modifiesMultipleShards {
+					sql = fmt.Sprintf("SELECT master_modify_multiple_shards('%s')", strings.Replace(sql, "'", "''", -1))
+				}
+			}
+			return sql, "DELETE"
 		}
 	}
 	return "", ""
