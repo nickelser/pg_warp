@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.1      2017-07-20
+
+* Show log message when replication origin is being created
+
+
 ## 0.3.0      2017-07-19
 
 * Handle distributed tables that have different primary keys than the source
