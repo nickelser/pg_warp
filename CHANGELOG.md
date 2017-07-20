@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.0      2017-07-19
+
+* Handle distributed tables that have different primary keys than the source
+
+
 ## 0.2.0      2017-07-18
 
 * Run truncate with all tables at once, to avoid problems with foreign keys
