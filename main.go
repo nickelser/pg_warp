@@ -629,6 +629,8 @@ func main() {
 			}
 		}
 
+		printProgress("Creating replication origin on destination...")
+
 		_, err = destinationConn.Exec(fmt.Sprintf("SELECT pg_replication_origin_create('%s')", originName))
 		if err != nil {
 			fmt.Printf("%s\n", err)
