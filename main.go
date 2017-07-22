@@ -150,15 +150,101 @@ func makeInitialBackup(sourceURL string, destinationURL string, snapshotName str
 	return nil
 }
 
-func handleDecodingMessage(message string, destinationConn *pgx.Conn, tables map[string][]string, distributedTables map[string]string, stats *logStats) error {
-	sql, sqlType := consumer.Decode(message, tables, distributedTables)
+type citusWorkaroundState struct {
+	deleteMap map[string]string
+}
+
+// This function contains all workarounds we need to do when replicating from
+// a single node Postgres system into a distributed Citus cluster
+func handleCitusWorkarounds(sql string, parseResult consumer.ParseResult, destinationURL string, tables map[string][]string, distributedTables map[string]string, state citusWorkaroundState) (citusWorkaroundState, string) {
+	partitionColumn, isDistributed := distributedTables[parseResult.Relation]
+	if !isDistributed {
+		return state, sql
+	}
+
+	switch parseResult.Action {
+	case "COMMIT":
+		state.deleteMap = map[string]string{}
+	case "INSERT":
+		replicaIdentity, _ := tables[parseResult.Relation]
+		partColumnMissingInReplicaIdentity := true
+		for _, identityColumnName := range replicaIdentity {
+			if partitionColumn == identityColumnName {
+				partColumnMissingInReplicaIdentity = false
+			}
+		}
+
+		// In the unlikely chance of us deleting this same row in this transaction,
+		// we need to rewrite that DELETE to include the partition column
+		if partColumnMissingInReplicaIdentity {
+			whereClauses := []string{}
+			for _, column := range parseResult.Columns {
+				for _, identityColumnName := range replicaIdentity {
+					if column.Name == identityColumnName {
+						whereClauses = append(whereClauses, column.Name+" = "+column.Value)
+					}
+				}
+			}
+			originalSQL := fmt.Sprintf("DELETE FROM %s WHERE %s", parseResult.Relation, strings.Join(whereClauses, " AND "))
+			newSQL := originalSQL
+			for _, column := range parseResult.Columns {
+				if column.Name == partitionColumn {
+					newSQL += " AND " + column.Name + " = " + column.Value
+				}
+			}
+			state.deleteMap[originalSQL] = newSQL
+		}
+	case "DELETE":
+		// Destination has the partition column in the primary key, but the source does not
+		partitionValueMissing := true
+		for _, column := range parseResult.Columns {
+			if column.Name == partitionColumn {
+				partitionValueMissing = false
+			}
+		}
+		if partitionValueMissing {
+			newSQL, ok := state.deleteMap[sql]
+			if ok {
+				sql = newSQL
+			} else {
+				alternateConn, err := openDestinationConn(destinationURL)
+				if err != nil {
+					fmt.Printf("ERROR: Failed to open alternate connection to destination: %s\n", err)
+					os.Exit(1)
+				}
+				var inputResult string
+				whereClauses := []string{}
+				for _, column := range parseResult.Columns {
+					whereClauses = append(whereClauses, column.Name+" = "+column.Value)
+				}
+				err = alternateConn.QueryRow(fmt.Sprintf("SELECT quote_literal(%s) FROM %s WHERE %s", partitionColumn, parseResult.Relation, strings.Join(whereClauses, " AND "))).Scan(&inputResult)
+				alternateConn.Close()
+				if err != nil {
+					fmt.Printf("ERROR: Failed to retrieve missing partition value for DELETE: %s\n  SQL: %s\n", err, sql)
+					os.Exit(1)
+				}
+				if inputResult == "" {
+					fmt.Printf("ERROR: Retrieved empty result when retrieving missing partition value for DELETE\n  SQL: %s\n", sql)
+					os.Exit(1)
+				}
+				sql += " AND " + partitionColumn + " = " + inputResult
+			}
+		}
+	}
+
+	return state, sql
+}
+
+func handleDecodingMessage(message string, destinationConn *pgx.Conn, destinationURL string, tables map[string][]string, distributedTables map[string]string, citusState citusWorkaroundState, stats *logStats) (citusWorkaroundState, error) {
+	sql, parseResult := consumer.Decode(message, tables, distributedTables)
+	citusState, sql = handleCitusWorkarounds(sql, parseResult, destinationURL, tables, distributedTables, citusState)
 	if sql != "" {
 		_, err := destinationConn.Exec(sql)
 		if err != nil {
-			return fmt.Errorf("Could not apply stream to destination: %s\n  SQL: %s", err, sql)
+			return citusState, fmt.Errorf("Could not apply stream to destination: %s\n  SQL: %s\n", err, sql)
 		}
 	}
-	switch sqlType {
+	switch parseResult.Action {
 	case "COMMIT":
 		stats.tx++
 	case "INSERT":
@@ -168,7 +254,7 @@ func handleDecodingMessage(message string, destinationConn *pgx.Conn, tables map
 	case "DELETE":
 		stats.deletes++
 	}
-	return nil
+	return citusState, nil
 }
 
 type logStats struct {
@@ -214,7 +300,7 @@ func retrieveLagAndOutputStats(sourceConn *pgx.Conn, stats logStats, maxWal uint
 		stats.txPerSecond(), stats.insertsPerSecond(), stats.updatesPerSecond(), stats.deletesPerSecond(), pgx.FormatLSN(maxWal), replicationLag))
 }
 
-func startReplication(slotName string, replicationConn *pgx.ReplicationConn, sourceConn *pgx.Conn, destinationConn *pgx.Conn, tables map[string][]string, distributedTables map[string]string, originName string, lastCommittedSourceLsn string) (chan bool, error) {
+func startReplication(slotName string, replicationConn *pgx.ReplicationConn, sourceConn *pgx.Conn, destinationConn *pgx.Conn, destinationURL string, tables map[string][]string, distributedTables map[string]string, originName string, lastCommittedSourceLsn string) (chan bool, error) {
 	var err error
 
 	stop := make(chan bool)
@@ -245,6 +331,7 @@ func startReplication(slotName string, replicationConn *pgx.ReplicationConn, sou
 	go func() {
 		var maxWal uint64
 
+		citusState := citusWorkaroundState{deleteMap: map[string]string{}}
 		stats := logStats{start: time.Now()}
 
 		standbyStatusTick := time.Tick(standbyStatusInterval)
@@ -293,7 +380,7 @@ func startReplication(slotName string, replicationConn *pgx.ReplicationConn, sou
 						}
 					}
 
-					err = handleDecodingMessage(walString, destinationConn, tables, distributedTables, &stats)
+					citusState, err = handleDecodingMessage(walString, destinationConn, destinationURL, tables, distributedTables, citusState, &stats)
 					if err != nil {
 						fmt.Printf("ERROR: Failed to handle WAL message: %s\n", err)
 						os.Exit(1)
@@ -639,7 +726,7 @@ func main() {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
 
-	stop, err := startReplication(slotName, replicationConn, sourceConn, destinationConn, tables, distributedTables, originName, lastCommittedSourceLsn)
+	stop, err := startReplication(slotName, replicationConn, sourceConn, destinationConn, destinationURL, tables, distributedTables, originName, lastCommittedSourceLsn)
 	if err != nil {
 		fmt.Printf("%s\n", err)
 		return
