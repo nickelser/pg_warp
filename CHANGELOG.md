@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.0      2017-07-21
+
+* Apply multi-shard deletes on target using SELECT+DELETE
+* Show replication lag based on pg_current_xlog_location() always (to fix 9.4/9.5)
+
+
 ## 0.3.1      2017-07-20
 
 * Show log message when replication origin is being created
