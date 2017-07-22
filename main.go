@@ -203,14 +203,10 @@ func retrieveLagAndOutputStats(sourceConn *pgx.Conn, stats logStats, maxWal uint
 	var replicationLag string
 	var err error
 
-	err = sourceConn.QueryRow("SELECT COALESCE(pg_size_pretty(pg_xlog_location_diff(pg_current_xlog_flush_location(), replay_location)), 'n/a') FROM pg_stat_replication WHERE application_name = 'pg_warp'").Scan(&replicationLag)
+	err = sourceConn.QueryRow("SELECT COALESCE(pg_size_pretty(pg_xlog_location_diff(pg_current_xlog_location(), replay_location)), 'n/a') FROM pg_stat_replication WHERE application_name = 'pg_warp'").Scan(&replicationLag)
 	if err != nil {
-		if strings.HasPrefix(err.Error(), "ERROR: function pg_current_xlog_flush_location() does not exist") { // pre 9.6
-			replicationLag = "unknown"
-		} else {
-			fmt.Printf("ERROR: Failed to retrieve replication lag: %s\n", err)
-			os.Exit(1)
-		}
+		fmt.Printf("ERROR: Failed to retrieve replication lag: %s\n", err)
+		os.Exit(1)
 	}
 
 	// TODO: Add timestamp of last transaction replayed (after that COMMIT happened)
