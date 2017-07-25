@@ -98,7 +98,7 @@ func makeInitialBackup(sourceURL string, destinationURL string, snapshotName str
 					continue
 				}
 				switch parts[3] {
-				case "ACL", "COMMENT", "DATABASE", "EXTENSION":
+				case "ACL", "COMMENT", "DATABASE":
 					continue
 				case "SCHEMA":
 					if strings.HasPrefix(parts[4], "- public") {
