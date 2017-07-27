@@ -150,21 +150,22 @@ func makeInitialBackup(sourceURL string, destinationURL string, snapshotName str
 	return nil
 }
 
-type citusWorkaroundState struct {
-	deleteMap map[string]string
+type transactionState struct {
+	statements              []string
+	currentTransactionBatch int
+	deleteMap               map[string]string
+	prevMessage string
 }
 
 // This function contains all workarounds we need to do when replicating from
 // a single node Postgres system into a distributed Citus cluster
-func handleCitusWorkarounds(sql string, parseResult consumer.ParseResult, destinationURL string, tables map[string][]string, distributedTables map[string]string, state citusWorkaroundState) (citusWorkaroundState, string) {
+func handleCitusWorkarounds(sql string, parseResult consumer.ParseResult, destinationConnAlt *pgx.Conn, tables map[string][]string, distributedTables map[string]string, state transactionState, stats *logStats) (transactionState, string) {
 	partitionColumn, isDistributed := distributedTables[parseResult.Relation]
 	if !isDistributed {
 		return state, sql
 	}
 
 	switch parseResult.Action {
-	case "COMMIT":
-		state.deleteMap = map[string]string{}
 	case "INSERT":
 		replicaIdentity, _ := tables[parseResult.Relation]
 		partColumnMissingInReplicaIdentity := true
@@ -207,18 +208,13 @@ func handleCitusWorkarounds(sql string, parseResult consumer.ParseResult, destin
 			if ok {
 				sql = newSQL
 			} else {
-				alternateConn, err := openDestinationConn(destinationURL)
-				if err != nil {
-					fmt.Printf("ERROR: Failed to open alternate connection to destination: %s\n", err)
-					os.Exit(1)
-				}
+				stats.partitionColumnLookups++
 				var inputResult string
 				whereClauses := []string{}
 				for _, column := range parseResult.Columns {
 					whereClauses = append(whereClauses, column.Name+" = "+column.Value)
 				}
-				err = alternateConn.QueryRow(fmt.Sprintf("SELECT quote_literal(%s) FROM %s WHERE %s", partitionColumn, parseResult.Relation, strings.Join(whereClauses, " AND "))).Scan(&inputResult)
-				alternateConn.Close()
+				err := destinationConnAlt.QueryRow(fmt.Sprintf("SELECT quote_literal(%s) FROM %s WHERE %s", partitionColumn, parseResult.Relation, strings.Join(whereClauses, " AND "))).Scan(&inputResult)
 				if err != nil {
 					fmt.Printf("ERROR: Failed to retrieve missing partition value for DELETE: %s\n  SQL: %s\n", err, sql)
 					os.Exit(1)
@@ -235,15 +231,56 @@ func handleCitusWorkarounds(sql string, parseResult consumer.ParseResult, destin
 	return state, sql
 }
 
-func handleDecodingMessage(message string, destinationConn *pgx.Conn, destinationURL string, tables map[string][]string, distributedTables map[string]string, citusState citusWorkaroundState, stats *logStats) (citusWorkaroundState, error) {
-	sql, parseResult := consumer.Decode(message, tables, distributedTables)
-	citusState, sql = handleCitusWorkarounds(sql, parseResult, destinationURL, tables, distributedTables, citusState)
+const batchTransactionLimit = 10
+const batchStatementLimit = 50
+
+func batchStatements(message *pgx.WalMessage, sqlToBeProcessed string, parseResult consumer.ParseResult, txState transactionState) (transactionState, string) {
+	var sqlToRunNow string
+
+	if sqlToBeProcessed == "BEGIN" && txState.currentTransactionBatch > 0 {
+		sqlToRunNow = ""
+	} else if sqlToBeProcessed == "COMMIT" {
+		txState.currentTransactionBatch++
+		if txState.currentTransactionBatch+1 >= batchTransactionLimit {
+			// TODO: Replace now() with the timestamp from the COMMIT message (when running with include-timestamps)
+			txState.statements = append(txState.statements, fmt.Sprintf("SELECT pg_replication_origin_xact_setup('%s', now()); SELECT txid_current(); COMMIT", pgx.FormatLSN(message.WalStart)))
+			sqlToRunNow = strings.Join(txState.statements, "; ")
+			txState = transactionState{deleteMap: map[string]string{}}
+			return txState, sqlToRunNow
+		} else {
+			sqlToRunNow = ""
+		}
+	} else if sqlToBeProcessed != "" {
+		txState.statements = append(txState.statements, sqlToBeProcessed)
+		sqlToRunNow = ""
+	}
+
+	if len(txState.statements) > batchStatementLimit {
+		sqlToRunNow = strings.Join(txState.statements, "; ")
+		txState.statements = nil
+	}
+
+	return txState, sqlToRunNow
+}
+
+func handleDecodingMessage(message *pgx.WalMessage, destinationConn *pgx.Conn, destinationConnAlt *pgx.Conn, tables map[string][]string, distributedTables map[string]string, txState transactionState, stats *logStats, maxWal uint64) (transactionState, error, uint64) {
+	txState.prevMessage = string(message.WalData)
+	sql, parseResult := consumer.Decode(string(message.WalData), tables, distributedTables)
+
+	txState, sql = handleCitusWorkarounds(sql, parseResult, destinationConnAlt, tables, distributedTables, txState, stats)
+	txState, sql = batchStatements(message, sql, parseResult, txState)
+
 	if sql != "" {
 		_, err := destinationConn.Exec(sql)
 		if err != nil {
-			return citusState, fmt.Errorf("Could not apply stream to destination: %s\n  SQL: %s\n", err, sql)
+			return txState, fmt.Errorf("Could not apply stream to destination: %s\n  SQL: %v\n", err, sql), maxWal
+		}
+
+		if message.WalStart > maxWal {
+			maxWal = message.WalStart
 		}
 	}
+
 	switch parseResult.Action {
 	case "COMMIT":
 		stats.tx++
@@ -254,15 +291,16 @@ func handleDecodingMessage(message string, destinationConn *pgx.Conn, destinatio
 	case "DELETE":
 		stats.deletes++
 	}
-	return citusState, nil
+	return txState, nil, maxWal
 }
 
 type logStats struct {
-	start   time.Time
-	tx      uint64
-	inserts uint64
-	updates uint64
-	deletes uint64
+	start                  time.Time
+	tx                     uint64
+	inserts                uint64
+	updates                uint64
+	deletes                uint64
+	partitionColumnLookups uint64
 }
 
 func (s logStats) secondsElapsed() float64 {
@@ -285,22 +323,26 @@ func (s logStats) deletesPerSecond() float64 {
 	return float64(s.deletes) / s.secondsElapsed()
 }
 
+func (s logStats) partitionColumnLookupsPerSecond() float64 {
+	return float64(s.partitionColumnLookups) / s.secondsElapsed()
+}
+
 func retrieveLagAndOutputStats(sourceConn *pgx.Conn, stats logStats, maxWal uint64) {
 	var replicationLag string
 	var err error
 
-	err = sourceConn.QueryRow("SELECT COALESCE(pg_size_pretty(pg_xlog_location_diff(pg_current_xlog_location(), replay_location)), 'n/a') FROM pg_stat_replication WHERE application_name = 'pg_warp'").Scan(&replicationLag)
+	err = sourceConn.QueryRow("SELECT to_char(COALESCE(NULLIF(pg_xlog_location_diff(pg_current_xlog_location(), replay_location), 0) / 1024 / 1024, -1), 'FM999,999,999,999,999') || ' MB' FROM pg_stat_replication WHERE application_name = 'pg_warp'").Scan(&replicationLag)
 	if err != nil {
 		fmt.Printf("ERROR: Failed to retrieve replication lag: %s\n", err)
 		os.Exit(1)
 	}
 
 	// TODO: Add timestamp of last transaction replayed (after that COMMIT happened)
-	printProgress(fmt.Sprintf("Stats: %0.2f TX/s, %0.2f inserts/s, %0.2f updates/s, %0.2f deletes/s, last LSN received: %s, replication lag: %s",
-		stats.txPerSecond(), stats.insertsPerSecond(), stats.updatesPerSecond(), stats.deletesPerSecond(), pgx.FormatLSN(maxWal), replicationLag))
+	printProgress(fmt.Sprintf("Stats: %0.2f TX/s, %0.2f inserts/s, %0.2f updates/s, %0.2f deletes/s, %0.2f partition column lookups/s, last LSN received: %s, replication lag: %s",
+		stats.txPerSecond(), stats.insertsPerSecond(), stats.updatesPerSecond(), stats.deletesPerSecond(), stats.partitionColumnLookupsPerSecond(), pgx.FormatLSN(maxWal), replicationLag))
 }
 
-func startReplication(slotName string, replicationConn *pgx.ReplicationConn, sourceConn *pgx.Conn, destinationConn *pgx.Conn, destinationURL string, tables map[string][]string, distributedTables map[string]string, originName string, lastCommittedSourceLsn string) (chan bool, error) {
+func startReplication(slotName string, replicationConn *pgx.ReplicationConn, sourceConn *pgx.Conn, destinationConn *pgx.Conn, destinationConnAlt *pgx.Conn, tables map[string][]string, distributedTables map[string]string, originName string, lastCommittedSourceLsn string) (chan bool, error) {
 	var err error
 
 	stop := make(chan bool)
@@ -311,6 +353,8 @@ func startReplication(slotName string, replicationConn *pgx.ReplicationConn, sou
 		if err != nil {
 			return stop, fmt.Errorf("Failed to parse last committed source LSN: %s", err)
 		}
+		// Resuming will return all transactions before the one passed in - skip the last commited one as well
+		startLsn++
 	}
 
 	err = replicationConn.StartReplication(slotName, startLsn, -1)
@@ -331,7 +375,7 @@ func startReplication(slotName string, replicationConn *pgx.ReplicationConn, sou
 	go func() {
 		var maxWal uint64
 
-		citusState := citusWorkaroundState{deleteMap: map[string]string{}}
+		txState := transactionState{deleteMap: map[string]string{}}
 		stats := logStats{start: time.Now()}
 
 		standbyStatusTick := time.Tick(standbyStatusInterval)
@@ -369,30 +413,17 @@ func startReplication(slotName string, replicationConn *pgx.ReplicationConn, sou
 
 			if message != nil {
 				if message.WalMessage != nil {
-					walString := string(message.WalMessage.WalData)
-
-					if strings.HasPrefix(walString, "COMMIT") {
-						// FIXME: Replace now() with the timestamp from the COMMIT message (when running with include-timestamps)
-						_, err = destinationConn.Exec(fmt.Sprintf("SELECT pg_replication_origin_xact_setup('%s', now()); SELECT txid_current();", pgx.FormatLSN(message.WalMessage.WalStart)))
-						if err != nil {
-							fmt.Printf("ERROR: Could not setup replication origin for transaction on destination: %s\n", err)
-							os.Exit(1)
-						}
-					}
-
-					citusState, err = handleDecodingMessage(walString, destinationConn, destinationURL, tables, distributedTables, citusState, &stats)
+					txState, err, maxWal = handleDecodingMessage(message.WalMessage, destinationConn, destinationConnAlt, tables, distributedTables, txState, &stats, maxWal)
 					if err != nil {
 						fmt.Printf("ERROR: Failed to handle WAL message: %s\n", err)
 						os.Exit(1)
 					}
-
-					if message.WalMessage.WalStart > maxWal {
-						maxWal = message.WalMessage.WalStart
-					}
 				}
 				if message.ServerHeartbeat != nil && message.ServerHeartbeat.ReplyRequested == '1' {
+					fmt.Printf("standby status requested\n")
 					sendStandbyStatus = true
 				}
+				message = nil
 			}
 
 			if sendStandbyStatus {
@@ -551,7 +582,7 @@ func openSourceConn(sourceURL string) (*pgx.Conn, *pgx.ReplicationConn, error) {
 }
 
 func openDestinationConn(destinationURL string) (*pgx.Conn, error) {
-	destinationConnConfig, err := pgx.ParseURI(destinationURL)
+	destinationConnConfig, err := pgx.ParseConnectionString(destinationURL)
 	if err != nil {
 		return nil, err
 	}
@@ -646,6 +677,13 @@ func main() {
 	}
 	defer destinationConn.Close()
 
+	destinationConnAlt, err := openDestinationConn(destinationURL)
+	if err != nil {
+		fmt.Printf("ERROR: Unable to establish alternate destination SQL connection: %v\n", err)
+		return
+	}
+	defer destinationConnAlt.Close()
+
 	tables, err := getPrimaryKeys(sourceConn, includedTables, excludedTables)
 	if err != nil {
 		fmt.Printf("ERROR: Could not determine primary keys on source: %v\n", err)
@@ -730,7 +768,7 @@ func main() {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
 
-	stop, err := startReplication(slotName, replicationConn, sourceConn, destinationConn, destinationURL, tables, distributedTables, originName, lastCommittedSourceLsn)
+	stop, err := startReplication(slotName, replicationConn, sourceConn, destinationConn, destinationConnAlt, tables, distributedTables, originName, lastCommittedSourceLsn)
 	if err != nil {
 		fmt.Printf("%s\n", err)
 		return
