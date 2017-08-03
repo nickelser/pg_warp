@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.1      2017-08-03
+
+* Don't require target objects to exist when syncing schema
+* Create extensions on destination system when syncing schema
+* Allow source/destination connection to be made without TLS
+* Ignore operator families when doing a full initial backup including schema
+
+
 ## 0.4.0      2017-07-21
 
 * Apply multi-shard deletes on target using SELECT+DELETE
