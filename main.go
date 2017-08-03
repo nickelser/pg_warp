@@ -531,7 +531,9 @@ func openSourceConn(sourceURL string) (*pgx.Conn, *pgx.ReplicationConn, error) {
 	}
 
 	// pgx misinterprets sslmode=require as sslmode=verify-full (and fails typically because it misses the CA)
-	sourceConnConfig.TLSConfig.InsecureSkipVerify = true
+	if sourceConnConfig.TLSConfig != nil {
+		sourceConnConfig.TLSConfig.InsecureSkipVerify = true
+	}
 	sourceConnConfig.RuntimeParams["application_name"] = "pg_warp"
 
 	sourceConn, err := pgx.Connect(sourceConnConfig)
@@ -555,7 +557,9 @@ func openDestinationConn(destinationURL string) (*pgx.Conn, error) {
 	}
 
 	// pgx misinterprets sslmode=require as sslmode=verify-full (and fails typically because it misses the CA)
-	destinationConnConfig.TLSConfig.InsecureSkipVerify = true
+	if destinationConnConfig.TLSConfig != nil {
+		destinationConnConfig.TLSConfig.InsecureSkipVerify = true
+	}
 	destinationConnConfig.RuntimeParams["application_name"] = "pg_warp"
 
 	destinationConn, err := pgx.Connect(destinationConnConfig)
