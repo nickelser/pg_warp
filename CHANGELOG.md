@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.5.0      2017-08-11
+
+* Add optional statement and transaction batching
+  - This is experimental right now but has been used successfully, and can be
+    particularly helpful if you are seeing replication lag issues
+  - Transaction batching will merge multiple smaller transactions together into
+    one large one (this works because pg_warp is a single writer), to avoid
+    roundtrip costs of BEGIN/COMMIT
+  - Statement batching will merge multiple statements in the same transaction
+    together into a multi-statement string, in order to save on roundtrip times
+    otherwise incurred with sending individual statements and waiting for their
+    results
+  - Both statement and transaction batching are turned off by default
+
+
 ## 0.4.1      2017-08-03
 
 * Don't require target objects to exist when syncing schema
