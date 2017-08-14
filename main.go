@@ -13,8 +13,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/citusdata/pg_warp/consumer"
 	"github.com/jackc/pgx"
+	"github.com/nickelser/pg_warp/consumer"
 	flag "github.com/ogier/pflag"
 )
 
@@ -39,6 +39,9 @@ func printProgress(message string) {
 }
 
 func makeInitialBackup(sourceURL string, destinationURL string, snapshotName string, syncSchema bool, parallelDump uint32, parallelRestore uint32, tmpDir string, includedTables []string, excludedTables []string) error {
+	if snapshotName == "" {
+		return fmt.Errorf("Empty snapshot name for source. This may be due to a higher `client_min_messages` setting than 'error' on the source DB.\n")
+	}
 	dumpCommand := fmt.Sprintf("pg_dump --snapshot=%s -d %s", snapshotName, sourceURL)
 	restoreCommand := fmt.Sprintf("pg_restore --no-acl --no-owner -d %s", destinationURL)
 	if syncSchema {
@@ -69,6 +72,7 @@ func makeInitialBackup(sourceURL string, destinationURL string, snapshotName str
 		} else {
 			printProgress("Running initial backup dump...")
 		}
+		printProgress(dumpCommand)
 		cmd := exec.Command("/bin/sh", "-c", dumpCommand)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stdout
@@ -259,11 +263,14 @@ func batchStatements(message *pgx.WalMessage, sqlToBeProcessed string, parseResu
 	return txState, sqlToRunNow
 }
 
-func handleDecodingMessage(message *pgx.WalMessage, destinationConn *pgx.Conn, destinationConnAlt *pgx.Conn, tables map[string][]string, distributedTables map[string]string, txState transactionState, stats *logStats, maxWal uint64, batchTransactionLimit uint32, batchStatementLimit uint32) (transactionState, uint64, error) {
+func handleDecodingMessage(message *pgx.WalMessage, destinationConn *pgx.Conn, destinationConnAlt *pgx.Conn, tables map[string][]string, isCitusTarget bool, distributedTables map[string]string, txState transactionState, stats *logStats, maxWal uint64, batchTransactionLimit uint32, batchStatementLimit uint32) (transactionState, uint64, error) {
 	txState.prevMessage = string(message.WalData)
 	sql, parseResult := consumer.Decode(string(message.WalData), tables, distributedTables)
 
-	txState, sql = handleCitusWorkarounds(sql, parseResult, destinationConnAlt, tables, distributedTables, txState, stats)
+	if isCitusTarget {
+		txState, sql = handleCitusWorkarounds(sql, parseResult, destinationConnAlt, tables, distributedTables, txState, stats)
+	}
+
 	txState, sql = batchStatements(message, sql, parseResult, txState, batchTransactionLimit, batchStatementLimit)
 
 	if sql != "" {
@@ -338,7 +345,7 @@ func retrieveLagAndOutputStats(sourceConn *pgx.Conn, stats logStats, maxWal uint
 		stats.txPerSecond(), stats.insertsPerSecond(), stats.updatesPerSecond(), stats.deletesPerSecond(), stats.partitionColumnLookupsPerSecond(), pgx.FormatLSN(maxWal), replicationLag))
 }
 
-func startReplication(slotName string, replicationConn *pgx.ReplicationConn, sourceConn *pgx.Conn, destinationConn *pgx.Conn, destinationConnAlt *pgx.Conn, tables map[string][]string, distributedTables map[string]string, originName string, lastCommittedSourceLsn string, batchTransactionLimit uint32, batchStatementLimit uint32) (chan bool, error) {
+func startReplication(slotName string, replicationConn *pgx.ReplicationConn, sourceConn *pgx.Conn, destinationConn *pgx.Conn, destinationConnAlt *pgx.Conn, tables map[string][]string, isCitusTarget bool, distributedTables map[string]string, originName string, lastCommittedSourceLsn string, batchTransactionLimit uint32, batchStatementLimit uint32) (chan bool, error) {
 	var err error
 
 	stop := make(chan bool)
@@ -409,7 +416,7 @@ func startReplication(slotName string, replicationConn *pgx.ReplicationConn, sou
 
 			if message != nil {
 				if message.WalMessage != nil {
-					txState, maxWal, err = handleDecodingMessage(message.WalMessage, destinationConn, destinationConnAlt, tables, distributedTables, txState, &stats, maxWal, batchTransactionLimit, batchStatementLimit)
+					txState, maxWal, err = handleDecodingMessage(message.WalMessage, destinationConn, destinationConnAlt, tables, isCitusTarget, distributedTables, txState, &stats, maxWal, batchTransactionLimit, batchStatementLimit)
 					if err != nil {
 						fmt.Printf("ERROR: Failed to handle WAL message: %s\n", err)
 						os.Exit(1)
@@ -507,7 +514,7 @@ func getPrimaryKeys(sourceConn *pgx.Conn, includedTables []string, excludedTable
 	return tables, nil
 }
 
-func getDistributedTables(destinationConn *pgx.Conn, includedTables []string, excludedTables []string) (map[string]string, error) {
+func getDistributedTables(destinationConn *pgx.Conn, includedTables []string, excludedTables []string) (map[string]string, bool, error) {
 	rows, err := destinationConn.Query("SELECT nspname, relname, part_key" +
 		" FROM (SELECT nspname, relname FROM pg_dist_partition" +
 		" JOIN pg_class ON (pg_class.oid = pg_dist_partition.logicalrelid)" +
@@ -515,7 +522,11 @@ func getDistributedTables(destinationConn *pgx.Conn, includedTables []string, ex
 		" master_get_table_metadata(nspname || '.' || relname)" +
 		" WHERE part_key IS NOT NULL")
 	if err != nil {
-		return nil, err
+		if strings.Contains(err.Error(), "relation \"pg_dist_partition\" does not exist") {
+			return map[string]string{}, false, nil
+		}
+
+		return nil, false, err
 	}
 	defer rows.Close()
 
@@ -526,7 +537,7 @@ func getDistributedTables(destinationConn *pgx.Conn, includedTables []string, ex
 		var partKey string
 		err = rows.Scan(&nspname, &relname, &partKey)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		skip := false
 		if len(includedTables) > 0 {
@@ -548,7 +559,7 @@ func getDistributedTables(destinationConn *pgx.Conn, includedTables []string, ex
 			partKeyByTable[nspname+"."+relname] = partKey
 		}
 	}
-	return partKeyByTable, nil
+	return partKeyByTable, true, nil
 }
 
 func openSourceConn(sourceURL string) (*pgx.Conn, *pgx.ReplicationConn, error) {
@@ -602,6 +613,7 @@ func openDestinationConn(destinationURL string) (*pgx.Conn, error) {
 	}
 
 	// Disable Citus deadlock prevention to allow multi-shard modifications
+	// harmless on non-Citus systems
 	_, err = destinationConn.Exec("SET citus.enable_deadlock_prevention = off")
 	if err != nil {
 		destinationConn.Close()
@@ -627,6 +639,7 @@ func main() {
 	var clean bool
 	var skipInitialSync bool
 	var syncSchema bool
+	var isCitusTarget bool
 	var parallelDump uint32
 	var parallelRestore uint32
 	var tmpDir string
@@ -690,10 +703,14 @@ func main() {
 		return
 	}
 
-	distributedTables, err := getDistributedTables(destinationConn, includedTables, excludedTables)
+	distributedTables, isCitusTarget, err := getDistributedTables(destinationConn, includedTables, excludedTables)
 	if err != nil {
 		fmt.Printf("ERROR: Could not determine distributed tables on destination: %v\n", err)
 		return
+	}
+
+	if isCitusTarget {
+		fmt.Printf("Target DB contains Citus distributed tables\n")
 	}
 
 	var lastCommittedSourceLsn string
@@ -733,6 +750,8 @@ func main() {
 			return
 		}
 
+		printProgress(fmt.Sprintf("Created replication slot, with slot: '%s' and snapshot: '%s'", slotName, snapshotName))
+
 		if !skipInitialSync {
 			if !syncSchema {
 				printProgress("Truncating destination tables...")
@@ -768,7 +787,7 @@ func main() {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
 
-	stop, err := startReplication(slotName, replicationConn, sourceConn, destinationConn, destinationConnAlt, tables, distributedTables, originName, lastCommittedSourceLsn, batchTransactionLimit, batchStatementLimit)
+	stop, err := startReplication(slotName, replicationConn, sourceConn, destinationConn, destinationConnAlt, tables, isCitusTarget, distributedTables, originName, lastCommittedSourceLsn, batchTransactionLimit, batchStatementLimit)
 	if err != nil {
 		fmt.Printf("%s\n", err)
 		return
