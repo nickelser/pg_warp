@@ -345,7 +345,7 @@ func retrieveLagAndOutputStats(sourceConn *pgx.Conn, stats logStats, maxWal uint
 		stats.txPerSecond(), stats.insertsPerSecond(), stats.updatesPerSecond(), stats.deletesPerSecond(), stats.partitionColumnLookupsPerSecond(), pgx.FormatLSN(maxWal), replicationLag))
 }
 
-func startReplication(slotName string, replicationConn *pgx.ReplicationConn, sourceConn *pgx.Conn, destinationConn *pgx.Conn, destinationConnAlt *pgx.Conn, tables map[string][]string, isCitusTarget bool, distributedTables map[string]string, originName string, lastCommittedSourceLsn string, batchTransactionLimit uint32, batchStatementLimit uint32) (chan bool, error) {
+func startReplication(slotName string, replicationConn *pgx.ReplicationConn, sourceConn *pgx.Conn, destinationConn *pgx.Conn, destinationConnAlt *pgx.Conn, tables map[string][]string, isCitusTarget bool, distributedTables map[string]string, originName string, skipReplicationProgress bool, lastCommittedSourceLsn string, batchTransactionLimit uint32, batchStatementLimit uint32) (chan bool, error) {
 	var err error
 
 	stop := make(chan bool)
@@ -367,9 +367,11 @@ func startReplication(slotName string, replicationConn *pgx.ReplicationConn, sou
 
 	printProgress("Started replication")
 
-	_, err = destinationConn.Exec(fmt.Sprintf("SELECT pg_replication_origin_session_setup('%s')", originName))
-	if err != nil {
-		return stop, fmt.Errorf("Failed to setup replication origin session on destination: %v", err)
+	if !skipReplicationProgress {
+		_, err = destinationConn.Exec(fmt.Sprintf("SELECT pg_replication_origin_session_setup('%s')", originName))
+		if err != nil {
+			return stop, fmt.Errorf("Failed to setup replication origin session on destination: %v", err)
+		}
 	}
 
 	standbyStatusInterval := time.Duration(1 * time.Second)
@@ -433,16 +435,20 @@ func startReplication(slotName string, replicationConn *pgx.ReplicationConn, sou
 				var lsnStr string
 				var lsn uint64
 
-				err = destinationConn.QueryRow("SELECT COALESCE(pg_replication_origin_session_progress(true), '0/0')").Scan(&lsnStr)
-				if err != nil {
-					fmt.Printf("ERROR: Failed to retrieve replication origin progress from destination session: %s\n", err)
-					os.Exit(1)
-				}
+				if !skipReplicationProgress {
+					err = destinationConn.QueryRow("SELECT COALESCE(pg_replication_origin_session_progress(true), '0/0')").Scan(&lsnStr)
+					if err != nil {
+						fmt.Printf("ERROR: Failed to retrieve replication origin progress from destination session: %s\n", err)
+						os.Exit(1)
+					}
 
-				lsn, err = pgx.ParseLSN(lsnStr)
-				if err != nil {
-					fmt.Printf("ERROR: Failed to parse destination session progress LSN: %s\n", err)
-					os.Exit(1)
+					lsn, err = pgx.ParseLSN(lsnStr)
+					if err != nil {
+						fmt.Printf("ERROR: Failed to parse destination session progress LSN: %s\n", err)
+						os.Exit(1)
+					}
+				} else {
+					lsn = maxWal
 				}
 
 				status, err = pgx.NewStandbyStatus(lsn, lsn, maxWal)
@@ -635,11 +641,13 @@ func main() {
 	var originName string
 	var sourceURL string
 	var destinationURL string
+	var dumpSourceURL string
 	var resync bool
 	var clean bool
 	var skipInitialSync bool
 	var syncSchema bool
 	var isCitusTarget bool
+	var skipReplicationProgress bool
 	var parallelDump uint32
 	var parallelRestore uint32
 	var tmpDir string
@@ -653,6 +661,7 @@ func main() {
 	flag.StringVar(&slotName, "slot", "pg_warp", "Name of the logical replication slot on the source database")
 	flag.StringVar(&originName, "origin", "pg_warp", "Name of the replication origin on the destination database")
 	flag.StringVarP(&sourceURL, "source", "s", "", "postgres:// connection string for the source database (user needs replication privileges)")
+	flag.StringVar(&dumpSourceURL, "dump-source", "", "postgres:// connection string for the source to be used for the initial backup (can be a read replica of the source to reduce load on the source)")
 	flag.StringVarP(&destinationURL, "destination", "d", "", "postgres:// connection string for the destination database")
 	flag.Uint32Var(&parallelDump, "parallel-dump", 1, "Number of parallel operations whilst dumping the initial sync data (default 1 = not parallel)")
 	flag.Uint32Var(&parallelRestore, "parallel-restore", 1, "Number of parallel operations whilst restoring the initial sync data (default 1 = not parallel)")
@@ -661,6 +670,7 @@ func main() {
 	flag.StringVar(&tmpDir, "tmp-dir", "", "Directory where we store temporary files as part of parallel operations (this needs to be fast and have space for your full data set)")
 	flag.BoolVar(&resync, "resync", false, "Resynchronize replication with a new initial backup")
 	flag.BoolVar(&clean, "clean", false, "Cleans replication slot on source, and replication origin on destination (run this after you don't need replication anymore)")
+	flag.BoolVar(&skipReplicationProgress, "skip-replication-progress", false, "Skip progress tracking on the destination DB. WARNING: VERY DANGEROUS!")
 	flag.VarP(&includedTables, "table", "t", "dump, restore and replicate the named table(s) only")
 	flag.VarP(&excludedTables, "exclude-table", "T", "do NOT dump, restore and replicate the named table(s)")
 	flag.Parse()
@@ -713,7 +723,7 @@ func main() {
 		fmt.Printf("Target DB contains Citus distributed tables\n")
 	}
 
-	var lastCommittedSourceLsn string
+	lastCommittedSourceLsn := ""
 
 	if resync || clean {
 		_, err = sourceConn.Exec(fmt.Sprintf("SELECT pg_drop_replication_slot('%s')", slotName))
@@ -722,16 +732,23 @@ func main() {
 			return
 		}
 
-		_, err = destinationConn.Exec(fmt.Sprintf("SELECT pg_replication_origin_drop('%s')", originName))
-		if err != nil && !strings.HasPrefix(err.Error(), fmt.Sprintf("ERROR: cache lookup failed for replication origin '%s'", originName)) {
-			fmt.Printf("ERROR: Could not drop replication origin: %s\n", err)
-			return
+		if !skipReplicationProgress {
+			_, err = destinationConn.Exec(fmt.Sprintf("SELECT pg_replication_origin_drop('%s')", originName))
+			if err != nil && !strings.HasPrefix(err.Error(), fmt.Sprintf("ERROR: cache lookup failed for replication origin '%s'", originName)) {
+				fmt.Printf("ERROR: Could not drop replication origin: %s\n", err)
+				return
+			}
 		}
 	} else {
 		err = destinationConn.QueryRow(fmt.Sprintf("SELECT COALESCE(pg_replication_origin_progress('%s', true), '0/0')", originName)).Scan(&lastCommittedSourceLsn)
 		if err != nil && !strings.HasPrefix(err.Error(), "ERROR: cache lookup failed for replication origin") {
 			fmt.Printf("ERROR: Failed to retrieve replication origin progress from destination: %s\n", err)
-			os.Exit(1)
+			if skipReplicationProgress {
+				lastCommittedSourceLsn = "0/0"
+				fmt.Println("As --skip-replication-progress is enabled, using '0/0' as our committed LSN.")
+			} else {
+				os.Exit(1)
+			}
 		}
 	}
 
@@ -762,7 +779,13 @@ func main() {
 				}
 			}
 
-			err = makeInitialBackup(sourceURL, destinationURL, snapshotName, syncSchema, parallelDump, parallelRestore, tmpDir, []string(includedTables), []string(excludedTables))
+			var resolvedSourceURL string
+			if dumpSourceURL == "" {
+				resolvedSourceURL = sourceURL
+			} else {
+				resolvedSourceURL = dumpSourceURL
+			}
+			err = makeInitialBackup(resolvedSourceURL, destinationURL, snapshotName, syncSchema, parallelDump, parallelRestore, tmpDir, []string(includedTables), []string(excludedTables))
 			if err != nil {
 				fmt.Printf("ERROR: Initial backup failed: %s\n", err)
 				err = replicationConn.DropReplicationSlot(slotName)
@@ -773,12 +796,14 @@ func main() {
 			}
 		}
 
-		printProgress("Creating replication origin on destination...")
+		if !skipReplicationProgress {
+			printProgress("Creating replication origin on destination...")
 
-		_, err = destinationConn.Exec(fmt.Sprintf("SELECT pg_replication_origin_create('%s')", originName))
-		if err != nil {
-			fmt.Printf("%s\n", err)
-			return
+			_, err = destinationConn.Exec(fmt.Sprintf("SELECT pg_replication_origin_create('%s')", originName))
+			if err != nil {
+				fmt.Printf("%s\n", err)
+				return
+			}
 		}
 	} else {
 		printProgress(fmt.Sprintf("Resuming previous operation for slot %s, last committed source LSN: %s", slotName, lastCommittedSourceLsn))
@@ -787,7 +812,7 @@ func main() {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
 
-	stop, err := startReplication(slotName, replicationConn, sourceConn, destinationConn, destinationConnAlt, tables, isCitusTarget, distributedTables, originName, lastCommittedSourceLsn, batchTransactionLimit, batchStatementLimit)
+	stop, err := startReplication(slotName, replicationConn, sourceConn, destinationConn, destinationConnAlt, tables, isCitusTarget, distributedTables, originName, skipReplicationProgress, lastCommittedSourceLsn, batchTransactionLimit, batchStatementLimit)
 	if err != nil {
 		fmt.Printf("%s\n", err)
 		return
