@@ -174,7 +174,7 @@ func parseTableMessage(message string) (ParseResult, error) {
 }
 
 // Decode - Decodes a logical decoding message into SQL
-func Decode(message string, replicaIdentities map[string][]string, distributedTables map[string]string) (string, ParseResult) {
+func Decode(message string, replicaIdentities map[string][]string, distributedTables map[string]string, upsert bool) (string, ParseResult) {
 	if strings.HasPrefix(message, "BEGIN") {
 		return "BEGIN", ParseResult{Action: "BEGIN"}
 	}
@@ -206,10 +206,16 @@ func Decode(message string, replicaIdentities map[string][]string, distributedTa
 		case "INSERT":
 			columnNames := []string{}
 			columnValues := []string{}
+			conflictValues := []string{}
 			for _, column := range parseResult.Columns {
 				columnNames = append(columnNames, column.Name)
 				columnValues = append(columnValues, column.Value)
+				conflictValues = append(conflictValues, column.Name+" = excluded."+column.Name)
 			}
+			if upsert {
+				return fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s) ON CONFLICT (%s) DO UPDATE SET %s", targetRelation, strings.Join(columnNames, ", "), strings.Join(columnValues, ", "), strings.Join(replicaIdentity, ", "), strings.Join(conflictValues, ", ")), parseResult
+			}
+
 			return fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", targetRelation, strings.Join(columnNames, ", "), strings.Join(columnValues, ", ")), parseResult
 		case "UPDATE":
 			partitionColumn, isDistributed := distributedTables[targetRelation]

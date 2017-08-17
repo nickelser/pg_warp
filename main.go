@@ -38,11 +38,18 @@ func printProgress(message string) {
 	fmt.Printf("%s: %s\n", time.Now().Format("2006-01-02 15:04:05.000 MST"), message)
 }
 
-func makeInitialBackup(sourceURL string, destinationURL string, snapshotName string, syncSchema bool, parallelDump uint32, parallelRestore uint32, tmpDir string, includedTables []string, excludedTables []string) error {
-	if snapshotName == "" {
+func makeInitialBackup(sourceURL string, dumpSourceURL string, destinationURL string, snapshotName string, syncSchema bool, parallelDump uint32, parallelRestore uint32, tmpDir string, includedTables []string, excludedTables []string) error {
+	if snapshotName == "" && dumpSourceURL == "" {
 		return fmt.Errorf("Empty snapshot name for source. This may be due to a higher `client_min_messages` setting than 'error' on the source DB.\n")
 	}
-	dumpCommand := fmt.Sprintf("pg_dump --snapshot=%s -d %s", snapshotName, sourceURL)
+	var dumpCommand string
+
+	if dumpSourceURL == "" {
+		dumpCommand = fmt.Sprintf("pg_dump --snapshot=%s -d %s", snapshotName, sourceURL)
+	} else {
+		dumpCommand = fmt.Sprintf("pg_dump -d %s", dumpSourceURL)
+	}
+
 	restoreCommand := fmt.Sprintf("pg_restore --no-acl --no-owner -d %s", destinationURL)
 	if syncSchema {
 		restoreCommand += " --clean --if-exists"
@@ -235,7 +242,7 @@ func handleCitusWorkarounds(sql string, parseResult consumer.ParseResult, destin
 	return state, sql
 }
 
-func batchStatements(message *pgx.WalMessage, sqlToBeProcessed string, parseResult consumer.ParseResult, txState transactionState, batchTransactionLimit uint32, batchStatementLimit uint32) (transactionState, string) {
+func batchStatements(message *pgx.WalMessage, sqlToBeProcessed string, parseResult consumer.ParseResult, txState transactionState, batchTransactionLimit uint32, batchStatementLimit uint32, skipReplicationProgress bool) (transactionState, string) {
 	var sqlToRunNow string
 
 	if sqlToBeProcessed == "BEGIN" && txState.currentTransactionBatch > 0 {
@@ -244,7 +251,11 @@ func batchStatements(message *pgx.WalMessage, sqlToBeProcessed string, parseResu
 		txState.currentTransactionBatch++
 		if txState.currentTransactionBatch+1 >= batchTransactionLimit {
 			// TODO: Replace now() with the timestamp from the COMMIT message (when running with include-timestamps)
-			txState.statements = append(txState.statements, fmt.Sprintf("SELECT pg_replication_origin_xact_setup('%s', now()); SELECT txid_current(); COMMIT", pgx.FormatLSN(message.WalStart)))
+			if skipReplicationProgress {
+				txState.statements = append(txState.statements, "COMMIT")
+			} else {
+				txState.statements = append(txState.statements, fmt.Sprintf("SELECT pg_replication_origin_xact_setup('%s', now()); SELECT txid_current(); COMMIT", pgx.FormatLSN(message.WalStart)))
+			}
 			sqlToRunNow = strings.Join(txState.statements, "; ")
 			txState = transactionState{deleteMap: map[string]string{}}
 			return txState, sqlToRunNow
@@ -263,15 +274,15 @@ func batchStatements(message *pgx.WalMessage, sqlToBeProcessed string, parseResu
 	return txState, sqlToRunNow
 }
 
-func handleDecodingMessage(message *pgx.WalMessage, destinationConn *pgx.Conn, destinationConnAlt *pgx.Conn, tables map[string][]string, isCitusTarget bool, distributedTables map[string]string, txState transactionState, stats *logStats, maxWal uint64, batchTransactionLimit uint32, batchStatementLimit uint32) (transactionState, uint64, error) {
+func handleDecodingMessage(message *pgx.WalMessage, destinationConn *pgx.Conn, destinationConnAlt *pgx.Conn, tables map[string][]string, upsert bool, skipReplicationProgress bool, isCitusTarget bool, distributedTables map[string]string, txState transactionState, stats *logStats, maxWal uint64, batchTransactionLimit uint32, batchStatementLimit uint32) (transactionState, uint64, error) {
 	txState.prevMessage = string(message.WalData)
-	sql, parseResult := consumer.Decode(string(message.WalData), tables, distributedTables)
+	sql, parseResult := consumer.Decode(string(message.WalData), tables, distributedTables, upsert)
 
 	if isCitusTarget {
 		txState, sql = handleCitusWorkarounds(sql, parseResult, destinationConnAlt, tables, distributedTables, txState, stats)
 	}
 
-	txState, sql = batchStatements(message, sql, parseResult, txState, batchTransactionLimit, batchStatementLimit)
+	txState, sql = batchStatements(message, sql, parseResult, txState, batchTransactionLimit, batchStatementLimit, skipReplicationProgress)
 
 	if sql != "" {
 		_, err := destinationConn.Exec(sql)
@@ -345,7 +356,7 @@ func retrieveLagAndOutputStats(sourceConn *pgx.Conn, stats logStats, maxWal uint
 		stats.txPerSecond(), stats.insertsPerSecond(), stats.updatesPerSecond(), stats.deletesPerSecond(), stats.partitionColumnLookupsPerSecond(), pgx.FormatLSN(maxWal), replicationLag))
 }
 
-func startReplication(slotName string, replicationConn *pgx.ReplicationConn, sourceConn *pgx.Conn, destinationConn *pgx.Conn, destinationConnAlt *pgx.Conn, tables map[string][]string, isCitusTarget bool, distributedTables map[string]string, originName string, skipReplicationProgress bool, lastCommittedSourceLsn string, batchTransactionLimit uint32, batchStatementLimit uint32) (chan bool, error) {
+func startReplication(slotName string, replicationConn *pgx.ReplicationConn, sourceConn *pgx.Conn, destinationConn *pgx.Conn, destinationConnAlt *pgx.Conn, tables map[string][]string, isCitusTarget bool, upsert bool, distributedTables map[string]string, originName string, skipReplicationProgress bool, lastCommittedSourceLsn string, batchTransactionLimit uint32, batchStatementLimit uint32) (chan bool, error) {
 	var err error
 
 	stop := make(chan bool)
@@ -418,7 +429,7 @@ func startReplication(slotName string, replicationConn *pgx.ReplicationConn, sou
 
 			if message != nil {
 				if message.WalMessage != nil {
-					txState, maxWal, err = handleDecodingMessage(message.WalMessage, destinationConn, destinationConnAlt, tables, isCitusTarget, distributedTables, txState, &stats, maxWal, batchTransactionLimit, batchStatementLimit)
+					txState, maxWal, err = handleDecodingMessage(message.WalMessage, destinationConn, destinationConnAlt, tables, upsert, skipReplicationProgress, isCitusTarget, distributedTables, txState, &stats, maxWal, batchTransactionLimit, batchStatementLimit)
 					if err != nil {
 						fmt.Printf("ERROR: Failed to handle WAL message: %s\n", err)
 						os.Exit(1)
@@ -642,11 +653,13 @@ func main() {
 	var sourceURL string
 	var destinationURL string
 	var dumpSourceURL string
+	var startLSN string
 	var resync bool
 	var clean bool
 	var skipInitialSync bool
 	var syncSchema bool
 	var isCitusTarget bool
+	var upsert bool
 	var skipReplicationProgress bool
 	var parallelDump uint32
 	var parallelRestore uint32
@@ -661,15 +674,17 @@ func main() {
 	flag.StringVar(&slotName, "slot", "pg_warp", "Name of the logical replication slot on the source database")
 	flag.StringVar(&originName, "origin", "pg_warp", "Name of the replication origin on the destination database")
 	flag.StringVarP(&sourceURL, "source", "s", "", "postgres:// connection string for the source database (user needs replication privileges)")
-	flag.StringVar(&dumpSourceURL, "dump-source", "", "postgres:// connection string for the source to be used for the initial backup (can be a read replica of the source to reduce load on the source)")
+	flag.StringVar(&dumpSourceURL, "dump-source", "", "postgres:// connection string for the source to be used for the initial backup (can be a read replica of the source to reduce load on the source). If this is different, the snapshots will not be syncronized, so please use --upsert.")
 	flag.StringVarP(&destinationURL, "destination", "d", "", "postgres:// connection string for the destination database")
 	flag.Uint32Var(&parallelDump, "parallel-dump", 1, "Number of parallel operations whilst dumping the initial sync data (default 1 = not parallel)")
 	flag.Uint32Var(&parallelRestore, "parallel-restore", 1, "Number of parallel operations whilst restoring the initial sync data (default 1 = not parallel)")
 	flag.Uint32Var(&batchTransactionLimit, "batch-transactions", 1, "Number of transactions that will be batched together (default 1 = no batching, recommended for some use cases = 10)")
 	flag.Uint32Var(&batchStatementLimit, "batch-statements", 1, "Number of statements that will be batched together (default 1 = no batching, recommended for some use cases = 50)")
 	flag.StringVar(&tmpDir, "tmp-dir", "", "Directory where we store temporary files as part of parallel operations (this needs to be fast and have space for your full data set)")
+	flag.StringVar(&startLSN, "start-lsn", "", "Override the start LSN (useful when restarting with --skip-replication-progress")
 	flag.BoolVar(&resync, "resync", false, "Resynchronize replication with a new initial backup")
 	flag.BoolVar(&clean, "clean", false, "Cleans replication slot on source, and replication origin on destination (run this after you don't need replication anymore)")
+	flag.BoolVar(&upsert, "upsert", false, "Do upserts instead of INSERTS & UPDATES. Useful if using a different dump source than the primary.")
 	flag.BoolVar(&skipReplicationProgress, "skip-replication-progress", false, "Skip progress tracking on the destination DB. WARNING: VERY DANGEROUS!")
 	flag.VarP(&includedTables, "table", "t", "dump, restore and replicate the named table(s) only")
 	flag.VarP(&excludedTables, "exclude-table", "T", "do NOT dump, restore and replicate the named table(s)")
@@ -739,12 +754,14 @@ func main() {
 				return
 			}
 		}
+	} else if startLSN != "" {
+		lastCommittedSourceLsn = startLSN
 	} else {
 		err = destinationConn.QueryRow(fmt.Sprintf("SELECT COALESCE(pg_replication_origin_progress('%s', true), '0/0')", originName)).Scan(&lastCommittedSourceLsn)
 		if err != nil && !strings.HasPrefix(err.Error(), "ERROR: cache lookup failed for replication origin") {
 			fmt.Printf("ERROR: Failed to retrieve replication origin progress from destination: %s\n", err)
 			if skipReplicationProgress {
-				lastCommittedSourceLsn = "0/0"
+				lastCommittedSourceLsn = ""
 				fmt.Println("As --skip-replication-progress is enabled, using '0/0' as our committed LSN.")
 			} else {
 				os.Exit(1)
@@ -779,13 +796,7 @@ func main() {
 				}
 			}
 
-			var resolvedSourceURL string
-			if dumpSourceURL == "" {
-				resolvedSourceURL = sourceURL
-			} else {
-				resolvedSourceURL = dumpSourceURL
-			}
-			err = makeInitialBackup(resolvedSourceURL, destinationURL, snapshotName, syncSchema, parallelDump, parallelRestore, tmpDir, []string(includedTables), []string(excludedTables))
+			err = makeInitialBackup(sourceURL, dumpSourceURL, destinationURL, snapshotName, syncSchema, parallelDump, parallelRestore, tmpDir, []string(includedTables), []string(excludedTables))
 			if err != nil {
 				fmt.Printf("ERROR: Initial backup failed: %s\n", err)
 				err = replicationConn.DropReplicationSlot(slotName)
@@ -812,7 +823,7 @@ func main() {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
 
-	stop, err := startReplication(slotName, replicationConn, sourceConn, destinationConn, destinationConnAlt, tables, isCitusTarget, distributedTables, originName, skipReplicationProgress, lastCommittedSourceLsn, batchTransactionLimit, batchStatementLimit)
+	stop, err := startReplication(slotName, replicationConn, sourceConn, destinationConn, destinationConnAlt, tables, isCitusTarget, upsert, distributedTables, originName, skipReplicationProgress, lastCommittedSourceLsn, batchTransactionLimit, batchStatementLimit)
 	if err != nil {
 		fmt.Printf("%s\n", err)
 		return
