@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"path"
 	"reflect"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -38,19 +39,24 @@ func printProgress(message string) {
 	fmt.Printf("%s: %s\n", time.Now().Format("2006-01-02 15:04:05.000 MST"), message)
 }
 
+func snipPassword(url string) string {
+	return regexp.MustCompile("://(.*?):(.*?)@").ReplaceAllString(url, "://$1:<snip>@")
+}
+
 func makeInitialBackup(sourceURL string, dumpSourceURL string, destinationURL string, snapshotName string, syncSchema bool, parallelDump uint32, parallelRestore uint32, tmpDir string, includedTables []string, excludedTables []string) error {
-	if snapshotName == "" && dumpSourceURL == "" {
-		return fmt.Errorf("Empty snapshot name for source. This may be due to a higher `client_min_messages` setting than 'error' on the source DB.\n")
-	}
 	var dumpCommand string
 
-	if dumpSourceURL == "" {
-		dumpCommand = fmt.Sprintf("pg_dump --snapshot=%s -d %s", snapshotName, sourceURL)
-	} else {
-		dumpCommand = fmt.Sprintf("pg_dump --no-synchronized-snapshots -d %s", dumpSourceURL)
+	if snapshotName == "" && dumpSourceURL == "" {
+		return fmt.Errorf("empty snapshot name for source. This may be due to a higher `client_min_messages` setting than 'error' on the source DB")
 	}
 
-	restoreCommand := fmt.Sprintf("pg_restore --no-acl --no-owner -d %s", destinationURL)
+	if dumpSourceURL == "" {
+		dumpCommand = fmt.Sprintf("pg_dump --snapshot=%s -v -d %s", snapshotName, sourceURL)
+	} else {
+		dumpCommand = fmt.Sprintf("pg_dump --no-synchronized-snapshots -v -d %s", dumpSourceURL)
+	}
+
+	restoreCommand := fmt.Sprintf("pg_restore -v --no-acl --no-owner -d %s", destinationURL)
 	if syncSchema {
 		restoreCommand += " --clean --if-exists"
 	} else {
@@ -68,7 +74,7 @@ func makeInitialBackup(sourceURL string, dumpSourceURL string, destinationURL st
 		dumpDir := path.Join(tmpDir, "dump")
 		err := os.MkdirAll(dumpDir, 0755)
 		if err != nil {
-			return fmt.Errorf("Could not create dump directory: %s\n", err)
+			return fmt.Errorf("could not create dump directory: %s", err)
 		}
 
 		dumpCommand += fmt.Sprintf(" -Fd -j %d -f %s", parallelDump, dumpDir)
@@ -79,13 +85,13 @@ func makeInitialBackup(sourceURL string, dumpSourceURL string, destinationURL st
 		} else {
 			printProgress("Running initial backup dump...")
 		}
-		printProgress(dumpCommand)
+		printProgress(snipPassword(dumpCommand))
 		cmd := exec.Command("/bin/sh", "-c", dumpCommand)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stdout
 		err = cmd.Run()
 		if err != nil {
-			return fmt.Errorf("Error dumping data: %s\n", err)
+			return fmt.Errorf("error dumping data: %s", err)
 		}
 
 		// For schema+data dumps we need to filter out bogus entries from the ToC
@@ -95,7 +101,7 @@ func makeInitialBackup(sourceURL string, dumpSourceURL string, destinationURL st
 
 			out, err = exec.Command("/bin/sh", "-c", fmt.Sprintf("pg_restore -l -Fd %s", dumpDir)).Output()
 			if err != nil {
-				return fmt.Errorf("Error writing pg_restore ToC file: %s\n", err)
+				return fmt.Errorf("error writing pg_restore ToC file: %s", err)
 			}
 
 			tocIn := strings.Split(string(out), "\n")
@@ -122,7 +128,7 @@ func makeInitialBackup(sourceURL string, dumpSourceURL string, destinationURL st
 			tocPath := path.Join(tmpDir, "pg_restore_toc")
 			err = ioutil.WriteFile(tocPath, []byte(strings.Join(tocOut, "\n")), 0744)
 			if err != nil {
-				return fmt.Errorf("Error writing ToC for pg_restore: %s\n", err)
+				return fmt.Errorf("error writing ToC for pg_restore: %s", err)
 			}
 
 			defer os.Remove(tocPath)
@@ -134,17 +140,18 @@ func makeInitialBackup(sourceURL string, dumpSourceURL string, destinationURL st
 		} else {
 			printProgress("Running initial backup restore...")
 		}
+		printProgress(snipPassword(restoreCommand))
 		cmd = exec.Command("/bin/sh", "-c", restoreCommand)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stdout
 		err = cmd.Run()
 		if err != nil {
-			return fmt.Errorf("Error restoring data: %s\n", err)
+			return fmt.Errorf("error restoring data: %s", err)
 		}
 
 		err = os.RemoveAll(dumpDir)
 		if err != nil {
-			return fmt.Errorf("Could not remove dump directory: %s\n", err)
+			return fmt.Errorf("could not remove dump directory: %s", err)
 		}
 	} else {
 		printProgress("Running initial backup...")
@@ -155,7 +162,7 @@ func makeInitialBackup(sourceURL string, dumpSourceURL string, destinationURL st
 		cmd.Stderr = os.Stdout
 		err := cmd.Run()
 		if err != nil {
-			return fmt.Errorf("Error copying data: %s\n", err)
+			return fmt.Errorf("error copying data: %s", err)
 		}
 	}
 	return nil
@@ -287,7 +294,7 @@ func handleDecodingMessage(message *pgx.WalMessage, destinationConn *pgx.Conn, d
 	if sql != "" {
 		_, err := destinationConn.Exec(sql)
 		if err != nil {
-			return txState, maxWal, fmt.Errorf("Could not apply stream to destination: %s\n  SQL: %v\n", err, sql)
+			return txState, maxWal, fmt.Errorf("could not apply stream to destination: %s\n  SQL: %v", err, sql)
 		}
 
 		if message.WalStart > maxWal {
@@ -799,10 +806,7 @@ func main() {
 			err = makeInitialBackup(sourceURL, dumpSourceURL, destinationURL, snapshotName, syncSchema, parallelDump, parallelRestore, tmpDir, []string(includedTables), []string(excludedTables))
 			if err != nil {
 				fmt.Printf("ERROR: Initial backup failed: %s\n", err)
-				err = replicationConn.DropReplicationSlot(slotName)
-				if err != nil {
-					fmt.Printf("ERROR: Could not drop replication slot: %s\n", err)
-				}
+				fmt.Printf("WARNING: Replication slot on origin still exists, re-run with \"--clean\" to remove (otherwise your source system can experience problems!)\n")
 				return
 			}
 		}
