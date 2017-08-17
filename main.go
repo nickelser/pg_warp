@@ -47,7 +47,7 @@ func makeInitialBackup(sourceURL string, dumpSourceURL string, destinationURL st
 	if dumpSourceURL == "" {
 		dumpCommand = fmt.Sprintf("pg_dump --snapshot=%s -d %s", snapshotName, sourceURL)
 	} else {
-		dumpCommand = fmt.Sprintf("pg_dump -d %s", dumpSourceURL)
+		dumpCommand = fmt.Sprintf("pg_dump --no-synchronized-snapshots -d %s", dumpSourceURL)
 	}
 
 	restoreCommand := fmt.Sprintf("pg_restore --no-acl --no-owner -d %s", destinationURL)
