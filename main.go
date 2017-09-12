@@ -493,6 +493,14 @@ func (fms *flagMultiString) Set(str string) error {
 	return nil
 }
 
+func createTableRegex(str string) *regexp.Regexp {
+	tbl := strings.Replace(str, ".", "\\.", -1)
+	tbl = strings.Replace(tbl, "?", ".", -1)
+	tbl = strings.Replace(tbl, "*", ".*", -1)
+	tbl = strings.Replace(tbl, "$", "\\$", -1)
+	return regexp.MustCompile(tbl)
+}
+
 // getPrimaryKeys - Gets primary keys from the source so we can correctly apply UPDATEs
 func getPrimaryKeys(sourceConn *pgx.Conn, includedTables []string, excludedTables []string) (map[string][]string, error) {
 	rows, err := sourceConn.Query("SELECT nspname, relname, array_agg(attname::text) FILTER (WHERE attname IS NOT NULL)" +
@@ -519,20 +527,24 @@ func getPrimaryKeys(sourceConn *pgx.Conn, includedTables []string, excludedTable
 		if len(includedTables) > 0 {
 			skip = true
 			for _, includedTable := range includedTables {
-				if includedTable == nspname+"."+relname || includedTable == relname {
+				var tblRegex = createTableRegex(includedTable)
+				if tblRegex.MatchString(nspname+"."+relname) || tblRegex.MatchString(relname) {
 					skip = false
 				}
 			}
 		}
 		if len(excludedTables) > 0 {
 			for _, excludedTable := range excludedTables {
-				if excludedTable == nspname+"."+relname || excludedTable == relname {
+				var tblRegex = createTableRegex(excludedTable)
+				if tblRegex.MatchString(nspname+"."+relname) || tblRegex.MatchString(relname) {
 					skip = true
 				}
 			}
 		}
 		if !skip {
 			tables[nspname+"."+relname] = cols
+		} else {
+			fmt.Printf("skipping %s for replication\n", nspname+"."+relname)
 		}
 	}
 	return tables, nil
@@ -806,7 +818,7 @@ func main() {
 			err = makeInitialBackup(sourceURL, dumpSourceURL, destinationURL, snapshotName, syncSchema, parallelDump, parallelRestore, tmpDir, []string(includedTables), []string(excludedTables))
 			if err != nil {
 				fmt.Printf("ERROR: Initial backup failed: %s\n", err)
-				fmt.Printf("WARNING: Replication slot on origin still exists, re-run with \"--clean\" to remove (otherwise your source system can experience problems!)\n")
+				fmt.Printf("WARNING: Replication slot and origin still exist, re-run with \"--clean\" to remove (otherwise your source system can experience problems!)\n")
 				return
 			}
 		}
